@@ -88,24 +88,21 @@ def update_expired_keys():
 
 
 # ==========================================
-# إعداد سيرفر الويب (Flask API للمود مينو)
+# إعداد سيرفر الويب (Flask API مع التحقق من HWID)
 # ==========================================
 
 app = Flask(__name__)
 
-@app.route('/check.php', methods=['POST'])
 @app.route('/check', methods=['POST'])
 def api_check_key():
     try:
         update_expired_keys()
         
-        # استقبال المفتاح من طلب المود مينو
-        key = request.form.get('key', '').strip()
-        if not key:
-            key = request.args.get('key', '').strip()
+        key = request.form.get('key', '').strip() or request.args.get('key', '').strip()
+        hwid = request.form.get('hwid', '').strip() or request.args.get('hwid', '').strip()
 
-        if not key:
-            return jsonify({"success": False, "message": "No key provided"})
+        if not key or not hwid:
+            return jsonify({"success": False, "message": "Key or HWID missing"})
 
         keys = load_keys()
 
@@ -114,26 +111,31 @@ def api_check_key():
 
         info = keys[key]
 
-        # التحقق هل المفتاح منتهي الصلاحية
         if is_expired(info):
             info["active"] = False
             info["expired"] = True
             save_keys(keys)
             return jsonify({"success": False, "message": "Key expired"})
 
-        # التحقق هل المفتاح مفعل وغير متوقف
-        if info.get("active", False) and not info.get("expired", False):
-            return jsonify({"success": True, "message": "Key is valid"})
-        else:
+        if not info.get("active", False):
             return jsonify({"success": False, "message": "Key is inactive"})
+
+        # التحقق من ربط الجهاز (HWID)
+        saved_hwid = info.get("hwid", "")
+        if not saved_hwid:
+            info["hwid"] = hwid
+            save_keys(keys)
+        elif saved_hwid != hwid:
+            return jsonify({"success": False, "message": "Key used on another device"})
+
+        return jsonify({"success": True, "message": "Key is valid"})
 
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
 
 
 def run_web_server():
-    # Render يتطلب الاستماع على البورت 10000 أو المخصص من البيئة
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
 
 
@@ -154,12 +156,11 @@ def send_message(chat_id, text, keyboard=None):
         }
 
     try:
-        r = requests.post(
+        requests.post(
             TELEGRAM_API + "sendMessage",
             json=data,
             timeout=20
         )
-        print("SEND:", r.text)
     except Exception as e:
         print("TELEGRAM SEND ERROR:", repr(e))
 
@@ -201,7 +202,10 @@ def main_keyboard():
             {"text": "🔴 إيقاف مفتاح"}
         ],
         [
-            {"text": "🗑️ حذف مفتاح"},
+            {"text": "🔄 تصفير جهاز مفتاح"},
+            {"text": "🗑️ حذف مفتاح"}
+        ],
+        [
             {"text": "🔎 معلومات مفتاح"}
         ]
     ]
@@ -238,6 +242,7 @@ def generate_key(chat_id, days, hours, minutes):
         "days": days,
         "hours": hours,
         "minutes": minutes,
+        "hwid": "",
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "expire": expire
     }
@@ -246,7 +251,7 @@ def generate_key(chat_id, days, hours, minutes):
 
     send_message(
         chat_id,
-        "✅ تم إنشاء المفتاح\n\n"
+        "✅ تم إنشاء المفتاح بنجاح\n\n"
         f"🔑 {key}\n\n"
         f"📅 الأيام: {days}\n"
         f"⏰ الساعات: {hours}\n"
@@ -262,7 +267,7 @@ def generate_key(chat_id, days, hours, minutes):
 
 def main():
     offset = 0
-    print("Moldes Key Bot Started with Web API")
+    print("Moldes Key Bot Started with Advanced Control")
 
     while True:
         try:
@@ -280,7 +285,6 @@ def main():
             data = response.json()
 
             if not data.get("ok", False):
-                print("Telegram error:", data)
                 time.sleep(3)
                 continue
 
@@ -297,8 +301,6 @@ def main():
                 user_id = message["from"]["id"]
                 text = message.get("text", "").strip()
 
-                print("Received:", repr(text))
-
                 if user_id != ADMIN_ID:
                     send_message(
                         chat_id,
@@ -311,7 +313,7 @@ def main():
                     custom_data.pop(chat_id, None)
                     send_message(
                         chat_id,
-                        "🔐 Moldes Key Bot\n\nاختر العملية:",
+                        "🔐 لوحة تحكم مفاتيح Moldes\n\nاختر العملية:",
                         main_keyboard()
                     )
                     continue
@@ -408,7 +410,7 @@ def main():
                         keys[text]["active"] = True
                         keys[text]["expired"] = False
                         save_keys(keys)
-                        send_message(chat_id, "✅ تم تفعيل المفتاح.", main_keyboard())
+                        send_message(chat_id, "✅ تم تفعيل المفتاح بنجاح.", main_keyboard())
                     states.pop(chat_id, None)
                     continue
 
@@ -424,13 +426,29 @@ def main():
                     else:
                         keys[text]["active"] = False
                         save_keys(keys)
-                        send_message(chat_id, "✅ تم إيقاف المفتاح.", main_keyboard())
+                        send_message(chat_id, "✅ تم إيقاف المفتاح بنجاح.", main_keyboard())
+                    states.pop(chat_id, None)
+                    continue
+
+                if text == "🔄 تصفير جهاز مفتاح":
+                    states[chat_id] = "reset_hwid"
+                    send_message(chat_id, "🔄 أرسل المفتاح لفك ربطه بجهازه الحالي (تصفير HWID):")
+                    continue
+
+                if states.get(chat_id) == "reset_hwid":
+                    keys = load_keys()
+                    if text not in keys:
+                        send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
+                    else:
+                        keys[text]["hwid"] = ""
+                        save_keys(keys)
+                        send_message(chat_id, "✅ تم تصفير جهاز المفتاح بنجاح! يمكن استخدامه على جهاز جديد الآن.", main_keyboard())
                     states.pop(chat_id, None)
                     continue
 
                 if text == "🗑️ حذف مفتاح":
                     states[chat_id] = "delete"
-                    send_message(chat_id, "🗑️ أرسل المفتاح الذي تريد حذفه.")
+                    send_message(chat_id, "🗑️ أرسل المفتاح الذي تريد حذفه نهائياً.")
                     continue
 
                 if states.get(chat_id) == "delete":
@@ -440,13 +458,13 @@ def main():
                     else:
                         del keys[text]
                         save_keys(keys)
-                        send_message(chat_id, "✅ تم حذف المفتاح.", main_keyboard())
+                        send_message(chat_id, "✅ تم حذف المفتاح نهائياً.", main_keyboard())
                     states.pop(chat_id, None)
                     continue
 
                 if text == "🔎 معلومات مفتاح":
                     states[chat_id] = "info"
-                    send_message(chat_id, "🔎 أرسل المفتاح.")
+                    send_message(chat_id, "🔎 أرسل المفتاح لعرض تفاصيله:")
                     continue
 
                 if states.get(chat_id) == "info":
@@ -464,11 +482,18 @@ def main():
                         if info.get("expired", False):
                             status = "⌛ منتهي"
 
+                        hwid_status = info.get('hwid', '')
+                        if not hwid_status:
+                            hwid_status = "غير مرتبط بأي جهاز (متاح)"
+                        else:
+                            hwid_status = f"مرتبط بجهاز: `{hwid_status}`"
+
                         send_message(
                             chat_id,
                             "🔎 معلومات المفتاح\n\n"
-                            f"🔑 {text}\n\n"
-                            f"الحالة: {status}\n\n"
+                            f"🔑 `{text}`\n\n"
+                            f"الحالة: {status}\n"
+                            f"📱 الجهاز: {hwid_status}\n\n"
                             f"🕐 الانتهاء:\n"
                             f"{info.get('expire', '-')}",
                             main_keyboard()
@@ -481,18 +506,19 @@ def main():
                     if not keys:
                         send_message(chat_id, "📋 لا توجد مفاتيح حاليًا.", main_keyboard())
                     else:
-                        lines = ["📋 قائمة المفاتيح\n"]
+                        lines = ["📋 قائمة المفاتيح الكاملة:\n"]
                         for key, info in keys.items():
                             if is_expired(info):
                                 info["active"] = False
                                 info["expired"] = True
                             status = "🟢" if info.get("active", False) else "🔴"
-                            lines.append(f"{status} {key}\n⏰ {info.get('expire', '-')}\n")
+                            bound = "📱 مرتبط" if info.get("hwid", "") else "💻 غير مرتبط"
+                            lines.append(f"{status} `{key}` | {bound}\n⏰ {info.get('expire', '-')}\n")
                         save_keys(keys)
                         send_message(chat_id, "\n".join(lines), main_keyboard())
                     continue
 
-                send_message(chat_id, "❓ اختر أحد الأزرار.", main_keyboard())
+                send_message(chat_id, "❓ اختر أحد الأزرار الظاهرة في القائمة.", main_keyboard())
 
         except Exception as e:
             print("MAIN ERROR:", repr(e))
@@ -500,10 +526,9 @@ def main():
 
 
 if __name__ == "__main__":
-    # تشغيل سيرفر الويب في خلفية منفصلة حتى لا يعطل بوت التيليجرام
-    server_thread = threading.Thread(target=run_web_server)
-    server_thread.daemon = True
-    server_thread.start()
+    telegram_thread = threading.Thread(target=main)
+    telegram_thread.daemon = True
+    telegram_thread.start()
 
-    # تشغيل بوت التيليجرام
-    main()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
