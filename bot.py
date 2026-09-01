@@ -88,27 +88,18 @@ def update_expired_keys():
 
 
 # ==========================================
-# إعداد سيرفر الويب (Flask API لجهاز واحد فقط)
+# إعداد سيرفر الويب (Flask API مع التحقق من HWID)
 # ==========================================
 
 app = Flask(__name__)
 
-@app.route('/check', methods=['GET', 'POST'])
+@app.route('/check', methods=['POST'])
 def api_check_key():
     try:
         update_expired_keys()
         
-        req_data = request.form if request.method == 'POST' else request.args
-        if not req_data and request.is_json:
-            req_data = request.get_json() or {}
-
-        key = req_data.get('key', '').strip()
-        hwid = (
-            req_data.get('hwid', '').strip()
-            or req_data.get('device', '').strip()
-            or req_data.get('device_id', '').strip()
-            or req_data.get('ID', '').strip()
-        )
+        key = request.form.get('key', '').strip() or request.args.get('key', '').strip()
+        hwid = request.form.get('hwid', '').strip() or request.args.get('hwid', '').strip()
 
         if not key or not hwid:
             return jsonify({"success": False, "message": "Key or HWID missing"})
@@ -129,18 +120,15 @@ def api_check_key():
         if not info.get("active", False):
             return jsonify({"success": False, "message": "Key is inactive"})
 
-        # التحقق من الجهاز (جهاز واحد فقط)
+        # التحقق من ربط الجهاز (HWID)
         saved_hwid = info.get("hwid", "")
-
-        if saved_hwid == hwid:
-            return jsonify({"success": True, "message": "Key is valid"})
-
         if not saved_hwid:
             info["hwid"] = hwid
             save_keys(keys)
-            return jsonify({"success": True, "message": "Key is valid"})
-        else:
-            return jsonify({"success": False, "message": "Key already used on another device"})
+        elif saved_hwid != hwid:
+            return jsonify({"success": False, "message": "Key used on another device"})
+
+        return jsonify({"success": True, "message": "Key is valid"})
 
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
@@ -155,11 +143,10 @@ def run_web_server():
 # Telegram Functions
 # ==========================================
 
-def send_message(chat_id, text, keyboard=None, parse_mode="Markdown"):
+def send_message(chat_id, text, keyboard=None):
     data = {
         "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode
+        "text": text
     }
 
     if keyboard is not None:
@@ -264,9 +251,11 @@ def generate_key(chat_id, days, hours, minutes):
 
     send_message(
         chat_id,
-        "✅ *تم إنشاء المفتاح بنجاح (لجهاز واحد)*\n\n"
-        f"`{key}`\n\n"
-        f"📅 الأيام: {days} | ⏰ الساعات: {hours}\n"
+        "✅ تم إنشاء المفتاح بنجاح\n\n"
+        f"🔑 {key}\n\n"
+        f"📅 الأيام: {days}\n"
+        f"⏰ الساعات: {hours}\n"
+        f"⏱️ الدقائق: {minutes}\n\n"
         f"🕐 الانتهاء:\n{expire}",
         main_keyboard()
     )
@@ -278,7 +267,7 @@ def generate_key(chat_id, days, hours, minutes):
 
 def main():
     offset = 0
-    print("Moldes Key Bot Started Classic Mode")
+    print("Moldes Key Bot Started with Advanced Control")
 
     while True:
         try:
@@ -324,7 +313,7 @@ def main():
                     custom_data.pop(chat_id, None)
                     send_message(
                         chat_id,
-                        "🔐 *لوحة تحكم مفاتيح Moldes*\n\nاختر العملية:",
+                        "🔐 لوحة تحكم مفاتيح Moldes\n\nاختر العملية:",
                         main_keyboard()
                     )
                     continue
@@ -334,49 +323,40 @@ def main():
                     custom_data.pop(chat_id, None)
                     send_message(
                         chat_id,
-                        "🔐 *القائمة الرئيسية:*",
+                        "🔐 القائمة الرئيسية:",
                         main_keyboard()
                     )
                     continue
 
-                current_state = states.get(chat_id)
-
-                # 1. إنشاء مفتاح
                 if text == "🔑 إنشاء مفتاح":
                     states[chat_id] = "duration"
                     send_message(
                         chat_id,
-                        "⏳ *اختر مدة المفتاح:*",
+                        "⏳ اختر مدة المفتاح:",
                         duration_keyboard()
                     )
                     continue
 
-                if current_state == "duration":
+                if states.get(chat_id) == "duration":
                     if text == "⚡ 1 يوم":
                         states.pop(chat_id, None)
-                        custom_data.pop(chat_id, None)
                         generate_key(chat_id, 1, 0, 0)
                         continue
-                    elif text == "📅 7 أيام":
+                    if text == "📅 7 أيام":
                         states.pop(chat_id, None)
-                        custom_data.pop(chat_id, None)
                         generate_key(chat_id, 7, 0, 0)
                         continue
-                    elif text == "📅 30 يوم":
+                    if text == "📅 30 يوم":
                         states.pop(chat_id, None)
-                        custom_data.pop(chat_id, None)
                         generate_key(chat_id, 30, 0, 0)
                         continue
-                    elif text == "🛠️ مدة مخصصة":
+                    if text == "🛠️ مدة مخصصة":
                         states[chat_id] = "days"
                         custom_data[chat_id] = {}
                         send_message(chat_id, "📅 اكتب عدد الأيام:")
                         continue
-                    else:
-                        send_message(chat_id, "❌ يرجى اختيار المدة من الأزرار المتاحة أدناه.")
-                        continue
 
-                elif current_state == "days":
+                if states.get(chat_id) == "days":
                     try:
                         days = int(text)
                         if days < 0:
@@ -385,10 +365,10 @@ def main():
                         states[chat_id] = "hours"
                         send_message(chat_id, "⏰ اكتب عدد الساعات:\nمن 0 إلى 23")
                     except:
-                        send_message(chat_id, "❌ اكتب رقمًا صحيحًا للأيام.")
+                        send_message(chat_id, "❌ اكتب رقمًا صحيحًا.")
                     continue
 
-                elif current_state == "hours":
+                if states.get(chat_id) == "hours":
                     try:
                         hours = int(text)
                         if hours < 0 or hours > 23:
@@ -400,7 +380,7 @@ def main():
                         send_message(chat_id, "❌ الساعات يجب أن تكون من 0 إلى 23.")
                     continue
 
-                elif current_state == "minutes":
+                if states.get(chat_id) == "minutes":
                     try:
                         minutes = int(text)
                         if minutes < 0 or minutes > 59:
@@ -409,9 +389,7 @@ def main():
                         hours = custom_data[chat_id]["hours"]
                         if days == 0 and hours == 0 and minutes == 0:
                             send_message(chat_id, "❌ المدة يجب أن تكون أكبر من صفر.")
-                            states[chat_id] = "days"
                             continue
-                        
                         states.pop(chat_id, None)
                         custom_data.pop(chat_id, None)
                         generate_key(chat_id, days, hours, minutes)
@@ -419,15 +397,13 @@ def main():
                         send_message(chat_id, "❌ الدقائق يجب أن تكون من 0 إلى 59.")
                     continue
 
-                # 2. تفعيل مفتاح
                 if text == "🟢 تفعيل مفتاح":
                     states[chat_id] = "activate"
-                    send_message(chat_id, "🟢 أرسل المفتاح الذي تريد تفعيله:")
+                    send_message(chat_id, "🟢 أرسل المفتاح الذي تريد تفعيله.")
                     continue
 
-                elif current_state == "activate":
+                if states.get(chat_id) == "activate":
                     keys = load_keys()
-                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
@@ -435,68 +411,64 @@ def main():
                         keys[text]["expired"] = False
                         save_keys(keys)
                         send_message(chat_id, "✅ تم تفعيل المفتاح بنجاح.", main_keyboard())
+                    states.pop(chat_id, None)
                     continue
 
-                # 3. إيقاف مفتاح
                 if text == "🔴 إيقاف مفتاح":
                     states[chat_id] = "deactivate"
-                    send_message(chat_id, "🔴 أرسل المفتاح الذي تريد إيقافه:")
+                    send_message(chat_id, "🔴 أرسل المفتاح الذي تريد إيقافه.")
                     continue
 
-                elif current_state == "deactivate":
+                if states.get(chat_id) == "deactivate":
                     keys = load_keys()
-                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
                         keys[text]["active"] = False
                         save_keys(keys)
                         send_message(chat_id, "✅ تم إيقاف المفتاح بنجاح.", main_keyboard())
+                    states.pop(chat_id, None)
                     continue
 
-                # 4. تصفير الجهاز المرتبط
                 if text == "🔄 تصفير جهاز مفتاح":
                     states[chat_id] = "reset_hwid"
-                    send_message(chat_id, "🔄 أرسل المفتاح لتفريغ الجهاز المرتبط به:")
+                    send_message(chat_id, "🔄 أرسل المفتاح لفك ربطه بجهازه الحالي (تصفير HWID):")
                     continue
 
-                elif current_state == "reset_hwid":
+                if states.get(chat_id) == "reset_hwid":
                     keys = load_keys()
-                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
                         keys[text]["hwid"] = ""
                         save_keys(keys)
-                        send_message(chat_id, "✅ تم تفريغ الجهاز المرتبط بالمفتاح بنجاح!", main_keyboard())
+                        send_message(chat_id, "✅ تم تصفير جهاز المفتاح بنجاح! يمكن استخدامه على جهاز جديد الآن.", main_keyboard())
+                    states.pop(chat_id, None)
                     continue
 
-                # 5. حذف مفتاح
                 if text == "🗑️ حذف مفتاح":
                     states[chat_id] = "delete"
-                    send_message(chat_id, "🗑️ أرسل المفتاح الذي تريد حذفه نهائياً:")
+                    send_message(chat_id, "🗑️ أرسل المفتاح الذي تريد حذفه نهائياً.")
                     continue
 
-                elif current_state == "delete":
+                if states.get(chat_id) == "delete":
                     keys = load_keys()
-                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
                         del keys[text]
                         save_keys(keys)
                         send_message(chat_id, "✅ تم حذف المفتاح نهائياً.", main_keyboard())
+                    states.pop(chat_id, None)
                     continue
 
-                # 6. معلومات مفتاح
                 if text == "🔎 معلومات مفتاح":
                     states[chat_id] = "info"
                     send_message(chat_id, "🔎 أرسل المفتاح لعرض تفاصيله:")
                     continue
 
-                elif current_state == "info":
+                if states.get(chat_id) == "info":
                     keys = load_keys()
-                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
@@ -510,39 +482,43 @@ def main():
                         if info.get("expired", False):
                             status = "⌛ منتهي"
 
-                        bound = "مفعل على جهاز" if info.get("hwid") else "غير مرتبط بجهاز"
+                        hwid_status = info.get('hwid', '')
+                        if not hwid_status:
+                            hwid_status = "غير مرتبط بأي جهاز (متاح)"
+                        else:
+                            hwid_status = f"مرتبط بجهاز: `{hwid_status}`"
 
                         send_message(
                             chat_id,
-                            "🔎 *معلومات المفتاح*\n\n"
-                            f"`{text}`\n\n"
+                            "🔎 معلومات المفتاح\n\n"
+                            f"🔑 `{text}`\n\n"
                             f"الحالة: {status}\n"
-                            f"📱 الجهاز: {bound}\n\n"
-                            f"🕐 الانتهاء:\n{info.get('expire', '-')}",
+                            f"📱 الجهاز: {hwid_status}\n\n"
+                            f"🕐 الانتهاء:\n"
+                            f"{info.get('expire', '-')}",
                             main_keyboard()
                         )
+                    states.pop(chat_id, None)
                     continue
 
-                # 7. قائمة المفاتيح
                 if text == "📋 قائمة المفاتيح":
-                    states.pop(chat_id, None)
                     keys = load_keys()
                     if not keys:
                         send_message(chat_id, "📋 لا توجد مفاتيح حاليًا.", main_keyboard())
                     else:
-                        lines = ["📋 *قائمة المفاتيح الكاملة:*\n"]
+                        lines = ["📋 قائمة المفاتيح الكاملة:\n"]
                         for key, info in keys.items():
                             if is_expired(info):
                                 info["active"] = False
                                 info["expired"] = True
                             status = "🟢" if info.get("active", False) else "🔴"
-                            bound = "🔗 مرتبط" if info.get("hwid") else "🟢 فارغ"
+                            bound = "📱 مرتبط" if info.get("hwid", "") else "💻 غير مرتبط"
                             lines.append(f"{status} `{key}` | {bound}\n⏰ {info.get('expire', '-')}\n")
                         save_keys(keys)
                         send_message(chat_id, "\n".join(lines), main_keyboard())
                     continue
 
-                send_message(chat_id, "❓ يرجى اختيار أحد الأزرار الظاهرة في القائمة.", main_keyboard())
+                send_message(chat_id, "❓ اختر أحد الأزرار الظاهرة في القائمة.", main_keyboard())
 
         except Exception as e:
             print("MAIN ERROR:", repr(e))
