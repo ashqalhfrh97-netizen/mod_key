@@ -98,7 +98,7 @@ def api_check_key():
     try:
         update_expired_keys()
         
-        # استقبال المفتاح من طلب المود مينو
+        # استقبال المفتاح بنفس طريقتك الأصلية المعتمدة
         key = request.form.get('key', '').strip()
         if not key:
             key = request.args.get('key', '').strip()
