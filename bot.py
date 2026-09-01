@@ -88,7 +88,7 @@ def update_expired_keys():
 
 
 # ==========================================
-# إعداد سيرفر الويب (Flask API مع التحقق من عدد الأجهزة)
+# إعداد سيرفر الويب (Flask API)
 # ==========================================
 
 app = Flask(__name__)
@@ -120,7 +120,6 @@ def api_check_key():
         if not info.get("active", False):
             return jsonify({"success": False, "message": "Key is inactive"})
 
-        # التحقق من الأجهزة المسموحة
         max_devices = info.get("max_devices", 1)
         devices = info.get("devices", [])
 
@@ -291,7 +290,7 @@ def generate_key(chat_id, days, hours, minutes, max_devices):
 
 def main():
     offset = 0
-    print("Moldes Key Bot Started with Device Limit & Copy Support")
+    print("Moldes Key Bot Started Safely")
 
     while True:
         try:
@@ -352,6 +351,9 @@ def main():
                     )
                     continue
 
+                current_state = states.get(chat_id)
+
+                # 1. إنشاء مفتاح - اختيار المدة
                 if text == "🔑 إنشاء مفتاح":
                     states[chat_id] = "duration"
                     send_message(
@@ -361,29 +363,29 @@ def main():
                     )
                     continue
 
-                if states.get(chat_id) == "duration":
+                if current_state == "duration":
                     if text == "⚡ 1 يوم":
                         custom_data[chat_id] = {"days": 1, "hours": 0, "minutes": 0}
                         states[chat_id] = "devices_count"
                         send_message(chat_id, "📱 *اختر عدد الأجهزة المسموح بها للكود:*", devices_keyboard())
                         continue
-                    if text == "📅 7 أيام":
+                    elif text == "📅 7 أيام":
                         custom_data[chat_id] = {"days": 7, "hours": 0, "minutes": 0}
                         states[chat_id] = "devices_count"
                         send_message(chat_id, "📱 *اختر عدد الأجهزة المسموح بها للكود:*", devices_keyboard())
                         continue
-                    if text == "📅 30 يوم":
+                    elif text == "📅 30 يوم":
                         custom_data[chat_id] = {"days": 30, "hours": 0, "minutes": 0}
                         states[chat_id] = "devices_count"
                         send_message(chat_id, "📱 *اختر عدد الأجهزة المسموح بها للكود:*", devices_keyboard())
                         continue
-                    if text == "🛠️ مدة مخصصة":
+                    elif text == "🛠️ مدة مخصصة":
                         states[chat_id] = "days"
                         custom_data[chat_id] = {}
                         send_message(chat_id, "📅 اكتب عدد الأيام:")
                         continue
 
-                if states.get(chat_id) == "days":
+                elif current_state == "days":
                     try:
                         days = int(text)
                         if days < 0:
@@ -392,10 +394,10 @@ def main():
                         states[chat_id] = "hours"
                         send_message(chat_id, "⏰ اكتب عدد الساعات:\nمن 0 إلى 23")
                     except:
-                        send_message(chat_id, "❌ اكتب رقمًا صحيحًا.")
+                        send_message(chat_id, "❌ اكتب رقمًا صحيحًا للأيام.")
                     continue
 
-                if states.get(chat_id) == "hours":
+                elif current_state == "hours":
                     try:
                         hours = int(text)
                         if hours < 0 or hours > 23:
@@ -407,24 +409,25 @@ def main():
                         send_message(chat_id, "❌ الساعات يجب أن تكون من 0 إلى 23.")
                     continue
 
-                if states.get(chat_id) == "minutes":
+                elif current_state == "minutes":
                     try:
                         minutes = int(text)
                         if minutes < 0 or minutes > 59:
                             raise ValueError
+                        custom_data[chat_id]["minutes"] = minutes
                         days = custom_data[chat_id]["days"]
                         hours = custom_data[chat_id]["hours"]
                         if days == 0 and hours == 0 and minutes == 0:
                             send_message(chat_id, "❌ المدة يجب أن تكون أكبر من صفر.")
+                            states[chat_id] = "days"
                             continue
-                        custom_data[chat_id]["minutes"] = minutes
                         states[chat_id] = "devices_count"
                         send_message(chat_id, "📱 *اختر عدد الأجهزة المسموح بها للكود:*", devices_keyboard())
                     except:
                         send_message(chat_id, "❌ الدقائق يجب أن تكون من 0 إلى 59.")
                     continue
 
-                if states.get(chat_id) == "devices_count":
+                elif current_state == "devices_count":
                     max_dev = 1
                     if text == "📱 1 جهاز":
                         max_dev = 1
@@ -435,24 +438,27 @@ def main():
                     elif text == "♾️ أجهزة غير محدودة":
                         max_dev = 999
                     else:
-                        send_message(chat_id, "❌ اختر من الأزرار المتاحة.")
+                        send_message(chat_id, "❌ يرجى الاختيار من الأزرار الظاهرة أدناه.")
                         continue
 
-                    d = custom_data[chat_id].get("days", 1)
+                    d = custom_data[chat_id].get("days", 0)
                     h = custom_data[chat_id].get("hours", 0)
                     m = custom_data[chat_id].get("minutes", 0)
+                    
                     states.pop(chat_id, None)
                     custom_data.pop(chat_id, None)
                     generate_key(chat_id, d, h, m, max_dev)
                     continue
 
+                # 2. تفعيل مفتاح
                 if text == "🟢 تفعيل مفتاح":
                     states[chat_id] = "activate"
                     send_message(chat_id, "🟢 أرسل المفتاح الذي تريد تفعيله:")
                     continue
 
-                if states.get(chat_id) == "activate":
+                elif current_state == "activate":
                     keys = load_keys()
+                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
@@ -460,64 +466,68 @@ def main():
                         keys[text]["expired"] = False
                         save_keys(keys)
                         send_message(chat_id, "✅ تم تفعيل المفتاح بنجاح.", main_keyboard())
-                    states.pop(chat_id, None)
                     continue
 
+                # 3. إيقاف مفتاح
                 if text == "🔴 إيقاف مفتاح":
                     states[chat_id] = "deactivate"
                     send_message(chat_id, "🔴 أرسل المفتاح الذي تريد إيقافه:")
                     continue
 
-                if states.get(chat_id) == "deactivate":
+                elif current_state == "deactivate":
                     keys = load_keys()
+                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
                         keys[text]["active"] = False
                         save_keys(keys)
                         send_message(chat_id, "✅ تم إيقاف المفتاح بنجاح.", main_keyboard())
-                    states.pop(chat_id, None)
                     continue
 
+                # 4. تصفير الأجهزة
                 if text == "🔄 تصفير أجهزة مفتاح":
                     states[chat_id] = "reset_hwid"
                     send_message(chat_id, "🔄 أرسل المفتاح لتفريغ أجهزته المسجلة:")
                     continue
 
-                if states.get(chat_id) == "reset_hwid":
+                elif current_state == "reset_hwid":
                     keys = load_keys()
+                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
                         keys[text]["devices"] = []
                         save_keys(keys)
                         send_message(chat_id, "✅ تم تصفير أجهزة المفتاح بنجاح!", main_keyboard())
-                    states.pop(chat_id, None)
                     continue
 
+                # 5. حذف مفتاح
                 if text == "🗑️ حذف مفتاح":
                     states[chat_id] = "delete"
                     send_message(chat_id, "🗑️ أرسل المفتاح الذي تريد حذفه نهائياً:")
                     continue
 
-                if states.get(chat_id) == "delete":
+                elif current_state == "delete":
                     keys = load_keys()
+                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
                         del keys[text]
                         save_keys(keys)
                         send_message(chat_id, "✅ تم حذف المفتاح نهائياً.", main_keyboard())
-                    states.pop(chat_id, None)
                     continue
 
+                # 6. معلومات مفتاح
                 if text == "🔎 معلومات مفتاح":
                     states[chat_id] = "info"
                     send_message(chat_id, "🔎 أرسل المفتاح لعرض تفاصيله:")
                     continue
 
-                if states.get(chat_id) == "info":
+                elif current_state == "info":
                     keys = load_keys()
+                    states.pop(chat_id, None)
                     if text not in keys:
                         send_message(chat_id, "❌ المفتاح غير موجود.", main_keyboard())
                     else:
@@ -534,7 +544,6 @@ def main():
                         devices_list = info.get("devices", [])
                         max_dev = info.get("max_devices", 1)
                         max_str = "غير محدودة" if max_dev == 999 else str(max_dev)
-
                         dev_info = f"المسجلة ({len(devices_list)} من {max_str})"
 
                         send_message(
@@ -546,10 +555,11 @@ def main():
                             f"🕐 الانتهاء:\n{info.get('expire', '-')}",
                             main_keyboard()
                         )
-                    states.pop(chat_id, None)
                     continue
 
+                # 7. قائمة المفاتيح
                 if text == "📋 قائمة المفاتيح":
+                    states.pop(chat_id, None)
                     keys = load_keys()
                     if not keys:
                         send_message(chat_id, "📋 لا توجد مفاتيح حاليًا.", main_keyboard())
@@ -568,7 +578,8 @@ def main():
                         send_message(chat_id, "\n".join(lines), main_keyboard())
                     continue
 
-                send_message(chat_id, "❓ اختر أحد الأزرار الظاهرة في القائمة.", main_keyboard())
+                # إذا لم تطابق أي حالة
+                send_message(chat_id, "❓ يرجى اختيار أحد الأزرار الظاهرة في القائمة الرئيسية.", main_keyboard())
 
         except Exception as e:
             print("MAIN ERROR:", repr(e))
