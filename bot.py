@@ -15,7 +15,7 @@ from flask import Flask, request, jsonify
 BOT_TOKEN = "8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc"
 ADMIN_ID = 8299101176
 
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
+TELEGRAM_API = f"https://modkey-production-0d27.up.railway.app"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KEYS_FILE = os.path.join(BASE_DIR, "keys.json")
@@ -93,19 +93,16 @@ def update_expired_keys():
 
 app = Flask(__name__)
 
-@app.route('/check', methods=['POST', 'GET'])
+@app.route('/check.php', methods=['POST'])
+@app.route('/check', methods=['POST'])
 def api_check_key():
     try:
         update_expired_keys()
         
-        # استقبال المفتاح بنفس طريقتك الأصلية المعتمدة
+        # استقبال المفتاح من طلب المود مينو
         key = request.form.get('key', '').strip()
         if not key:
             key = request.args.get('key', '').strip()
-
-        if not key and request.is_json:
-            data_json = request.get_json() or {}
-            key = str(data_json.get('key', '')).strip()
 
         if not key:
             return jsonify({"success": False, "message": "No key provided"})
@@ -135,7 +132,8 @@ def api_check_key():
 
 
 def run_web_server():
-    port = int(os.environ.get("PORT", 5000))
+    # Render يتطلب الاستماع على البورت 10000 أو المخصص من البيئة
+    port = int(os.environ.get("PORT", 10000))
     app.run(host='0.0.0.0', port=port)
 
 
@@ -156,11 +154,12 @@ def send_message(chat_id, text, keyboard=None):
         }
 
     try:
-        requests.post(
+        r = requests.post(
             TELEGRAM_API + "sendMessage",
             json=data,
             timeout=20
         )
+        print("SEND:", r.text)
     except Exception as e:
         print("TELEGRAM SEND ERROR:", repr(e))
 
@@ -281,6 +280,7 @@ def main():
             data = response.json()
 
             if not data.get("ok", False):
+                print("Telegram error:", data)
                 time.sleep(3)
                 continue
 
@@ -296,6 +296,8 @@ def main():
                 chat_id = message["chat"]["id"]
                 user_id = message["from"]["id"]
                 text = message.get("text", "").strip()
+
+                print("Received:", repr(text))
 
                 if user_id != ADMIN_ID:
                     send_message(
@@ -498,8 +500,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # تشغيل سيرفر الويب في خلفية منفصلة حتى لا يعطل بوت التيليجرام
     server_thread = threading.Thread(target=run_web_server)
     server_thread.daemon = True
     server_thread.start()
 
+    # تشغيل بوت التيليجرام
     main()
