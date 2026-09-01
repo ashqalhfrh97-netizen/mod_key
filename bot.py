@@ -88,21 +88,31 @@ def update_expired_keys():
 
 
 # ==========================================
-# إعداد سيرفر الويب (Flask API)
+# إعداد سيرفر الويب (Flask API مع مرونة استقبال البيانات)
 # ==========================================
 
 app = Flask(__name__)
 
-@app.route('/check', methods=['POST'])
+@app.route('/check', methods=['GET', 'POST'])
 def api_check_key():
     try:
         update_expired_keys()
         
-        key = request.form.get('key', '').strip() or request.args.get('key', '').strip()
-        hwid = request.form.get('hwid', '').strip() or request.args.get('hwid', '').strip()
+        # دعم استقبال البيانات سواء عبر POST (Form / JSON) أو GET (Query Parameters)
+        req_data = request.form if request.method == 'POST' else request.args
+        if not req_data and request.is_json:
+            req_data = request.get_json() or {}
+
+        key = req_data.get('key', '').strip()
+        hwid = (
+            req_data.get('hwid', '').strip()
+            or req_data.get('device', '').strip()
+            or req_data.get('device_id', '').strip()
+            or req_data.get('ID', '').strip()
+        )
 
         if not key or not hwid:
-            return jsonify({"success": False, "message": "Key or HWID missing"})
+            return jsonify({"success": False, "message": f"Key or HWID missing. Received Key: {key}, HWID: {hwid}"})
 
         keys = load_keys()
 
@@ -290,7 +300,7 @@ def generate_key(chat_id, days, hours, minutes, max_devices):
 
 def main():
     offset = 0
-    print("Moldes Key Bot Started Safely")
+    print("Moldes Key Bot Started Smoothly")
 
     while True:
         try:
@@ -384,6 +394,9 @@ def main():
                         custom_data[chat_id] = {}
                         send_message(chat_id, "📅 اكتب عدد الأيام:")
                         continue
+                    else:
+                        send_message(chat_id, "❌ يرجى اختيار المدة من الأزرار المتاحة أدناه.")
+                        continue
 
                 elif current_state == "days":
                     try:
@@ -438,7 +451,7 @@ def main():
                     elif text == "♾️ أجهزة غير محدودة":
                         max_dev = 999
                     else:
-                        send_message(chat_id, "❌ يرجى الاختيار من الأزرار الظاهرة أدناه.")
+                        send_message(chat_id, "❌ يرجى اختيار عدد الأجهزة من الأزرار الظاهرة أدناه.")
                         continue
 
                     d = custom_data[chat_id].get("days", 0)
