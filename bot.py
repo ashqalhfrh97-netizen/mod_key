@@ -109,16 +109,64 @@ def admin_panel():
         <html lang="ar" dir="rtl">
         <head>
             <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>تسجيل الدخول - AK TEAM</title>
             <style>
-                body { font-family: Tahoma, sans-serif; background: linear-gradient(-45deg, #111, #222, #1a1a1a, #000); background-size: 400% 400%; animation: gradientBG 10s ease infinite; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-                @keyframes gradientBG { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
-                .login-card { background: rgba(30, 30, 30, 0.85); backdrop-filter: blur(10px); padding: 30px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); width: 320px; text-align: center; }
+                * { box-sizing: border-box; }
+                body {
+                    font-family: Tahoma, sans-serif;
+                    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+                    background-size: 400% 400%;
+                    animation: gradientBG 10s ease infinite;
+                    color: #fff;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100vh;
+                    margin: 0;
+                }
+                @keyframes gradientBG {
+                    0% { background-position: 0% 50%; }
+                    50% { background-position: 100% 50%; }
+                    100% { background-position: 0% 50%; }
+                }
+                .login-card {
+                    background: rgba(20, 20, 30, 0.85);
+                    backdrop-filter: blur(12px);
+                    -webkit-backdrop-filter: blur(12px);
+                    padding: 30px;
+                    border-radius: 12px;
+                    box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+                    width: 320px;
+                    text-align: center;
+                    border: 1px solid rgba(255,255,255,0.1);
+                }
                 h2 { color: #4CAF50; margin-bottom: 20px; }
-                input { width: 90%; padding: 12px; margin: 10px 0; border-radius: 6px; border: 1px solid #444; background: #222; color: #fff; font-size: 14px; }
-                button { background: #4CAF50; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 16px; margin-top: 10px; font-weight: bold; }
+                input {
+                    width: 100%;
+                    padding: 12px;
+                    margin: 10px 0;
+                    border-radius: 6px;
+                    border: 1px solid #444;
+                    background: #111;
+                    color: #fff;
+                    font-size: 14px;
+                }
+                button {
+                    background: #4CAF50;
+                    color: white;
+                    border: none;
+                    padding: 12px;
+                    width: 100%;
+                    border-radius: 6px;
+                    cursor: pointer;
+                    font-size: 16px;
+                    margin-top: 10px;
+                    font-weight: bold;
+                    transition: 0.3s;
+                }
                 button:hover { background: #45a049; }
-                .error { color: #f44336; font-size: 13px; margin-top: 10px; }
+                .error { color: #ff5252; font-size: 13px; margin-top: 10px; }
             </style>
         </head>
         <body>
@@ -143,24 +191,58 @@ def admin_panel():
     <html lang="ar" dir="rtl">
     <head>
         <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>لوحة تحكم المفاتيح - AK TEAM</title>
         <style>
-            body { font-family: Tahoma, sans-serif; background: linear-gradient(-45deg, #0d0d0d, #1a1a1a, #111, #000); background-size: 400% 400%; animation: gradientBG 12s ease infinite; color: #fff; padding: 20px; margin: 0; min-height: 100vh; }
-            @keyframes gradientBG { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
-            .header { display: flex; justify-content: space-between; align-items: center; max-width: 900px; margin: 0 auto 20px auto; }
-            h1 { color: #4CAF50; margin: 0; text-shadow: 0 0 10px rgba(76,175,80,0.3); }
+            * { box-sizing: border-box; }
+            body {
+                font-family: Tahoma, sans-serif;
+                background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
+                background-size: 400% 400%;
+                animation: gradientBG 15s ease infinite;
+                color: #fff;
+                padding: 20px;
+                margin: 0;
+                min-height: 100vh;
+            }
+            @keyframes gradientBG {
+                0% { background-position: 0% 50%; }
+                50% { background-position: 100% 50%; }
+                100% { background-position: 0% 50%; }
+            }
+            .header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                max-width: 900px;
+                margin: 0 auto 20px auto;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            h1 { color: #4CAF50; margin: 0; text-shadow: 0 0 10px rgba(76,175,80,0.4); font-size: 22px; }
             .logout-btn { background: #f44336; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-size: 14px; }
-            .card { background: rgba(30, 30, 30, 0.85); backdrop-filter: blur(8px); padding: 20px; margin: 0 auto 20px auto; max-width: 900px; border-radius: 10px; box-shadow: 0 8px 20px rgba(0,0,0,0.4); }
-            button { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 15px; font-weight: bold; }
+            .card {
+                background: rgba(20, 20, 30, 0.85);
+                backdrop-filter: blur(12px);
+                -webkit-backdrop-filter: blur(12px);
+                padding: 20px;
+                margin: 0 auto 20px auto;
+                max-width: 900px;
+                border-radius: 10px;
+                box-shadow: 0 8px 25px rgba(0,0,0,0.5);
+                border: 1px solid rgba(255,255,255,0.08);
+                overflow-x: auto;
+            }
+            button { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 15px; font-weight: bold; transition: 0.3s; }
             button:hover { background: #45a049; }
-            .copy-btn { background: #2196F3; padding: 5px 10px; font-size: 12px; margin-right: 5px; }
+            .copy-btn { background: #2196F3; padding: 5px 10px; font-size: 12px; margin-top: 5px; }
             .copy-btn:hover { background: #0b7dda; }
             .delete-btn { background: #f44336; padding: 5px 10px; font-size: 13px; }
             .delete-btn:hover { background: #d32f2f; }
-            table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 15px; min-width: 600px; }
             th, td { border: 1px solid #333; padding: 10px; text-align: center; font-size: 14px; }
-            th { background: rgba(20,20,20,0.9); }
-            select, input { padding: 9px; border-radius: 5px; border: 1px solid #444; background: #222; color: #fff; margin-left: 5px; margin-bottom: 10px; }
+            th { background: rgba(15,15,25,0.95); color: #4CAF50; }
+            select, input { padding: 9px; border-radius: 5px; border: 1px solid #444; background: #111; color: #fff; margin-left: 5px; margin-bottom: 10px; }
             .form-group { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
         </style>
         <script>
@@ -226,7 +308,7 @@ def admin_panel():
                         <b>{{ key }}</b><br>
                         <button type="button" class="copy-btn" onclick="copyKey('{{ key }}')">نسخ</button>
                     </td>
-                    <td><span style="color: {{ 'green' if data.active else 'red' }};">{{ 'فعّال' if data.active else 'معطل' }}</span></td>
+                    <td><span style="color: {{ '#4CAF50' if data.active else '#f44336' }};">{{ 'فعّال' if data.active else 'معطل' }}</span></td>
                     <td>{{ data.hwid if data.hwid else 'غير مرتبط' }}</td>
                     <td>{{ data.expires_at if data.expires_at else 'دائم' }}</td>
                     <td>
@@ -245,30 +327,30 @@ def admin_panel():
     """
     return render_template_string(html_panel, keys=db)
 
-# مسار التحقق للمود (رسائل مبهمة وآمنة)
+# مسار التحقق للمود (رسائل عربية واضحة)
 @app.route("/check", methods=["POST", "GET"])
 def check_key():
     key = request.form.get("key") or request.args.get("key")
     hwid = request.form.get("hwid") or request.args.get("hwid")
     
     if not key:
-        return jsonify({"success": False, "message": "Invalid Request"}), 400
+        return jsonify({"success": False, "message": "الرجاء إدخال المفتاح"}), 400
 
     db = load_db()
     
     if key not in db:
-        return jsonify({"success": False, "message": "Key not found"})
+        return jsonify({"success": False, "message": "المفتاح خطأ أو غير موجود"})
     
     key_data = db[key]
     
     if not key_data.get("active", False):
-        return jsonify({"success": False, "message": "Key is inactive"})
+        return jsonify({"success": False, "message": "تم ايقاف هذا المفتاح"})
     
     expires_at = key_data.get("expires_at")
     if expires_at:
         exp_date = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
         if datetime.now() > exp_date:
-            return jsonify({"success": False, "message": "Key has expired"})
+            return jsonify({"success": False, "message": "انتهت صلاحية المفتاح"})
 
     saved_hwid = key_data.get("hwid")
     
@@ -277,11 +359,11 @@ def check_key():
             key_data["hwid"] = hwid
             save_db(db)
         else:
-            return jsonify({"success": False, "message": "Verification failed"})
+            return jsonify({"success": False, "message": "خطأ في بيانات الجهاز"})
     elif saved_hwid != hwid:
-        return jsonify({"success": False, "message": "Device mismatch"})
+        return jsonify({"success": False, "message": "تم استخدام الكود على جهاز آخر"})
     
-    return jsonify({"success": True, "message": "Success"})
+    return jsonify({"success": True, "message": "تم التفعيل بنجاح"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
