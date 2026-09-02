@@ -8,8 +8,8 @@ from flask import Flask, request, jsonify, render_template_string, session, redi
 app = Flask(__name__)
 app.secret_key = "ak_team_secret_key_secure"
 
-# بيانات الدخول للوحة التحكم
-ADMIN_USER = "@X50ASD"
+# بيانات الدخول للوحة التحكم (بدون رموز قد تسبب مشاكل بالمتصفح مثل الـ @)
+ADMIN_USER = "X50ASD"
 ADMIN_PASS = "basar2011"
 
 # ملف تخزين المفاتيح
@@ -32,65 +32,117 @@ def save_db(data):
     except Exception as e:
         print("Save error:", e)
 
-# صفحة تسجيل الدخول
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error = None
-    if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
-        if username == ADMIN_USER and password == ADMIN_PASS:
-            session["logged_in"] = True
-            return redirect(url_for("admin_panel"))
-        else:
-            error = "اسم المستخدم أو كلمة المرور غير صحيحة!"
-            
-    html = """
-    <!DOCTYPE html>
-    <html lang="ar" dir="rtl">
-    <head>
-        <meta charset="UTF-8">
-        <title>تسجيل الدخول - AK TEAM</title>
-        <style>
-            body { font-family: Tahoma, sans-serif; background: linear-gradient(-45deg, #111, #222, #1a1a1a, #000); background-size: 400% 400%; animation: gradientBG 10s ease infinite; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-            @keyframes gradientBG { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
-            .login-card { background: rgba(30, 30, 30, 0.85); backdrop-filter: blur(10px); padding: 30px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); width: 320px; text-align: center; }
-            h2 { color: #4CAF50; margin-bottom: 20px; }
-            input { width: 90%; padding: 12px; margin: 10px 0; border-radius: 6px; border: 1px solid #444; background: #222; color: #fff; font-size: 14px; }
-            button { background: #4CAF50; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 16px; margin-top: 10px; font-weight: bold; }
-            button:hover { background: #45a049; }
-            .error { color: #f44336; font-size: 13px; margin-top: 10px; }
-        </style>
-    </head>
-    <body>
-        <div class="login-card">
-            <h2>تسجيل دخول المشرف</h2>
-            <form method="POST">
-                <input type="text" name="username" placeholder="اسم المستخدم" required>
-                <input type="password" name="password" placeholder="كلمة المرور" required>
-                <button type="submit">دخول</button>
-            </form>
-            {% if error %}<div class="error">{{ error }}</div>{% endif %}
-        </div>
-    </body>
-    </html>
-    """
-    return render_template_string(html, error=error)
-
-@app.route("/logout")
-def logout():
-    session.pop("logged_in", None)
-    return redirect(url_for("login"))
-
-# لوحة التحكم الرئيسية
-@app.route("/", methods=["GET"])
+# صفحة تسجيل الدخول والتحكم بنفس الملف لتجنب مشاكل الـ 404
+@app.route("/", methods=["GET", "POST"])
 def admin_panel():
-    if not session.get("logged_in"):
-        return redirect(url_for("login"))
-        
-    db = load_db()
+    error = None
     
-    html = """
+    # معالجة تسجيل الدخول إذا تم إرسال البيانات
+    if request.method == "POST":
+        action = request.form.get("action")
+        
+        if action == "login":
+            username = request.form.get("username", "").strip()
+            password = request.form.get("password", "").strip()
+            if username == ADMIN_USER and password == ADMIN_PASS:
+                session["logged_in"] = True
+            else:
+                error = "اسم المستخدم أو كلمة المرور غير صحيحة!"
+                
+        elif action == "logout":
+            session.pop("logged_in", None)
+            return redirect(url_for("admin_panel"))
+            
+        elif action == "create":
+            if not session.get("logged_in"):
+                return redirect(url_for("admin_panel"))
+            
+            preset = request.form.get("preset_days", "0")
+            try:
+                hours = float(request.form.get("custom_hours", 0))
+                minutes = float(request.form.get("custom_minutes", 0))
+            except:
+                hours = 0
+                minutes = 0
+                
+            total_delta = timedelta(0)
+            is_permanent = False
+            
+            if preset == "permanent":
+                is_permanent = True
+            elif preset != "0":
+                total_delta = timedelta(days=float(preset))
+            elif hours > 0 or minutes > 0:
+                total_delta = timedelta(hours=hours, minutes=minutes)
+            else:
+                total_delta = timedelta(days=7)
+                
+            chars = string.ascii_uppercase + string.digits
+            key = "AK-" + "".join(random.choices(chars, k=4)) + "-" + "".join(random.choices(chars, k=4)) + "-" + "".join(random.choices(chars, k=4))
+            
+            if is_permanent:
+                expires_at = None
+            else:
+                expires_at = (datetime.now() + total_delta).strftime("%Y-%m-%d %H:%M:%S")
+                
+            db = load_db()
+            db[key] = {
+                "hwid": None,
+                "active": True,
+                "expires_at": expires_at
+            }
+            save_db(db)
+            return redirect(url_for("admin_panel"))
+            
+        elif action == "delete":
+            if not session.get("logged_in"):
+                return redirect(url_for("admin_panel"))
+            
+            key_to_delete = request.form.get("key")
+            db = load_db()
+            if key_to_delete in db:
+                del db[key_to_delete]
+                save_db(db)
+            return redirect(url_for("admin_panel"))
+
+    # إذا لم يكن مسجل دخول، اعرض صفحة تسجيل الدخول
+    if not session.get("logged_in"):
+        html_login = """
+        <!DOCTYPE html>
+        <html lang="ar" dir="rtl">
+        <head>
+            <meta charset="UTF-8">
+            <title>تسجيل الدخول - AK TEAM</title>
+            <style>
+                body { font-family: Tahoma, sans-serif; background: linear-gradient(-45deg, #111, #222, #1a1a1a, #000); background-size: 400% 400%; animation: gradientBG 10s ease infinite; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+                @keyframes gradientBG { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+                .login-card { background: rgba(30, 30, 30, 0.85); backdrop-filter: blur(10px); padding: 30px; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.5); width: 320px; text-align: center; }
+                h2 { color: #4CAF50; margin-bottom: 20px; }
+                input { width: 90%; padding: 12px; margin: 10px 0; border-radius: 6px; border: 1px solid #444; background: #222; color: #fff; font-size: 14px; }
+                button { background: #4CAF50; color: white; border: none; padding: 12px; width: 100%; border-radius: 6px; cursor: pointer; font-size: 16px; margin-top: 10px; font-weight: bold; }
+                button:hover { background: #45a049; }
+                .error { color: #f44336; font-size: 13px; margin-top: 10px; }
+            </style>
+        </head>
+        <body>
+            <div class="login-card">
+                <h2>تسجيل دخول المشرف</h2>
+                <form method="POST">
+                    <input type="hidden" name="action" value="login">
+                    <input type="text" name="username" placeholder="اسم المستخدم (X50ASD)" required>
+                    <input type="password" name="password" placeholder="كلمة المرور" required>
+                    <button type="submit">دخول</button>
+                </form>
+                {% if error %}<div class="error">{{ error }}</div>{% endif %}
+            </div>
+        </body>
+        </html>
+        """
+        return render_template_string(html_login, error=error)
+
+    # إذا كان مسجل دخول، اعرض لوحة التحكم
+    db = load_db()
+    html_panel = """
     <!DOCTYPE html>
     <html lang="ar" dir="rtl">
     <head>
@@ -101,7 +153,7 @@ def admin_panel():
             @keyframes gradientBG { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
             .header { display: flex; justify-content: space-between; align-items: center; max-width: 900px; margin: 0 auto 20px auto; }
             h1 { color: #4CAF50; margin: 0; text-shadow: 0 0 10px rgba(76,175,80,0.3); }
-            .logout-btn { background: #f44336; color: white; padding: 8px 15px; border-radius: 5px; text-decoration: none; font-size: 14px; }
+            .logout-btn { background: #f44336; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-size: 14px; }
             .card { background: rgba(30, 30, 30, 0.85); backdrop-filter: blur(8px); padding: 20px; margin: 0 auto 20px auto; max-width: 900px; border-radius: 10px; box-shadow: 0 8px 20px rgba(0,0,0,0.4); }
             button { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 15px; font-weight: bold; }
             button:hover { background: #45a049; }
@@ -117,12 +169,16 @@ def admin_panel():
     <body>
         <div class="header">
             <h1>لوحة تحكم مفاتيح المود - AK TEAM</h1>
-            <a href="/logout" class="logout-btn">تسجيل الخروج</a>
+            <form method="POST" style="margin:0;">
+                <input type="hidden" name="action" value="logout">
+                <button type="submit" class="logout-btn">تسجيل الخروج</button>
+            </form>
         </div>
         
         <div class="card">
             <h3>توليد مفتاح جديد</h3>
-            <form action="/create_key" method="GET">
+            <form method="POST">
+                <input type="hidden" name="action" value="create">
                 <div class="form-group">
                     <label>المدة الجاهزة:</label>
                     <select name="preset_days">
@@ -164,7 +220,11 @@ def admin_panel():
                     <td>{{ data.hwid if data.hwid else 'غير مرتبط' }}</td>
                     <td>{{ data.expires_at if data.expires_at else 'دائم' }}</td>
                     <td>
-                        <a href="/delete?key={{ key }}"><button class="delete-btn">حذف</button></a>
+                        <form method="POST" style="margin:0;">
+                            <input type="hidden" name="action" value="delete">
+                            <input type="hidden" name="key" value="{{ key }}">
+                            <button type="submit" class="delete-btn">حذف</button>
+                        </form>
                     </td>
                 </tr>
                 {% endfor %}
@@ -173,64 +233,7 @@ def admin_panel():
     </body>
     </html>
     """
-    return render_template_string(html, keys=db)
-
-# مسار توليد المفتاح مع دعم الساعات والدقائق المخصصة
-@app.route("/create_key", methods=["GET"])
-def create_key():
-    if not session.get("logged_in"):
-        return redirect(url_for("login"))
-        
-    preset = request.args.get("preset_days", "0")
-    try:
-        hours = float(request.args.get("custom_hours", 0))
-        minutes = float(request.args.get("custom_minutes", 0))
-    except:
-        hours = 0
-        minutes = 0
-        
-    total_delta = timedelta(0)
-    is_permanent = False
-    
-    if preset == "permanent":
-        is_permanent = True
-    elif preset != "0":
-        total_delta = timedelta(days=float(preset))
-    elif hours > 0 or minutes > 0:
-        total_delta = timedelta(hours=hours, minutes=minutes)
-    else:
-        total_delta = timedelta(days=7) # الافتراضي أسبوع إذا لم يتم اختيار شيء
-        
-    chars = string.ascii_uppercase + string.digits
-    key = "AK-" + "".join(random.choices(chars, k=4)) + "-" + "".join(random.choices(chars, k=4)) + "-" + "".join(random.choices(chars, k=4))
-    
-    if is_permanent:
-        expires_at = None
-    else:
-        expires_at = (datetime.now() + total_delta).strftime("%Y-%m-%d %H:%M:%S")
-        
-    db = load_db()
-    db[key] = {
-        "hwid": None,
-        "active": True,
-        "expires_at": expires_at
-    }
-    save_db(db)
-    
-    return redirect(url_for("admin_panel"))
-
-# مسار حذف مفتاح
-@app.route("/delete", methods=["GET"])
-def delete_key():
-    if not session.get("logged_in"):
-        return redirect(url_for("login"))
-        
-    key = request.args.get("key")
-    db = load_db()
-    if key in db:
-        del db[key]
-        save_db(db)
-    return redirect(url_for("admin_panel"))
+    return render_template_string(html_panel, keys=db)
 
 # مسار التحقق الأساسي للمود
 @app.route("/check", methods=["POST", "GET"])
