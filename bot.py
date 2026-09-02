@@ -8,7 +8,7 @@ from flask import Flask, request, jsonify, render_template_string, session, redi
 app = Flask(__name__)
 app.secret_key = "ak_team_secret_key_secure"
 
-# بيانات الدخول للوحة التحكم (بدون رموز قد تسبب مشاكل بالمتصفح مثل الـ @)
+# بيانات الدخول لوحة التحكم
 ADMIN_USER = "X50ASD"
 ADMIN_PASS = "basar2011"
 
@@ -32,12 +32,10 @@ def save_db(data):
     except Exception as e:
         print("Save error:", e)
 
-# صفحة تسجيل الدخول والتحكم بنفس الملف لتجنب مشاكل الـ 404
 @app.route("/", methods=["GET", "POST"])
 def admin_panel():
     error = None
     
-    # معالجة تسجيل الدخول إذا تم إرسال البيانات
     if request.method == "POST":
         action = request.form.get("action")
         
@@ -105,7 +103,6 @@ def admin_panel():
                 save_db(db)
             return redirect(url_for("admin_panel"))
 
-    # إذا لم يكن مسجل دخول، اعرض صفحة تسجيل الدخول
     if not session.get("logged_in"):
         html_login = """
         <!DOCTYPE html>
@@ -129,7 +126,7 @@ def admin_panel():
                 <h2>تسجيل دخول المشرف</h2>
                 <form method="POST">
                     <input type="hidden" name="action" value="login">
-                    <input type="text" name="username" placeholder="اسم المستخدم (X50ASD)" required>
+                    <input type="text" name="username" placeholder="اسم المستخدم" required>
                     <input type="password" name="password" placeholder="كلمة المرور" required>
                     <button type="submit">دخول</button>
                 </form>
@@ -140,7 +137,6 @@ def admin_panel():
         """
         return render_template_string(html_login, error=error)
 
-    # إذا كان مسجل دخول، اعرض لوحة التحكم
     db = load_db()
     html_panel = """
     <!DOCTYPE html>
@@ -157,6 +153,8 @@ def admin_panel():
             .card { background: rgba(30, 30, 30, 0.85); backdrop-filter: blur(8px); padding: 20px; margin: 0 auto 20px auto; max-width: 900px; border-radius: 10px; box-shadow: 0 8px 20px rgba(0,0,0,0.4); }
             button { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 15px; font-weight: bold; }
             button:hover { background: #45a049; }
+            .copy-btn { background: #2196F3; padding: 5px 10px; font-size: 12px; margin-right: 5px; }
+            .copy-btn:hover { background: #0b7dda; }
             .delete-btn { background: #f44336; padding: 5px 10px; font-size: 13px; }
             .delete-btn:hover { background: #d32f2f; }
             table { width: 100%; border-collapse: collapse; margin-top: 15px; }
@@ -165,6 +163,15 @@ def admin_panel():
             select, input { padding: 9px; border-radius: 5px; border: 1px solid #444; background: #222; color: #fff; margin-left: 5px; margin-bottom: 10px; }
             .form-group { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
         </style>
+        <script>
+            function copyKey(text) {
+                navigator.clipboard.writeText(text).then(function() {
+                    alert("تم نسخ المفتاح بنجاح: " + text);
+                }, function(err) {
+                    alert("فشل النسخ");
+                });
+            }
+        </script>
     </head>
     <body>
         <div class="header">
@@ -215,7 +222,10 @@ def admin_panel():
                 </tr>
                 {% for key, data in keys.items() %}
                 <tr>
-                    <td><b>{{ key }}</b></td>
+                    <td>
+                        <b>{{ key }}</b><br>
+                        <button type="button" class="copy-btn" onclick="copyKey('{{ key }}')">نسخ</button>
+                    </td>
                     <td><span style="color: {{ 'green' if data.active else 'red' }};">{{ 'فعّال' if data.active else 'معطل' }}</span></td>
                     <td>{{ data.hwid if data.hwid else 'غير مرتبط' }}</td>
                     <td>{{ data.expires_at if data.expires_at else 'دائم' }}</td>
@@ -235,14 +245,14 @@ def admin_panel():
     """
     return render_template_string(html_panel, keys=db)
 
-# مسار التحقق الأساسي للمود
+# مسار التحقق للمود (رسائل مبهمة وآمنة)
 @app.route("/check", methods=["POST", "GET"])
 def check_key():
     key = request.form.get("key") or request.args.get("key")
     hwid = request.form.get("hwid") or request.args.get("hwid")
     
     if not key:
-        return jsonify({"success": False, "message": "No key provided"}), 400
+        return jsonify({"success": False, "message": "Invalid Request"}), 400
 
     db = load_db()
     
@@ -254,14 +264,12 @@ def check_key():
     if not key_data.get("active", False):
         return jsonify({"success": False, "message": "Key is inactive"})
     
-    # فحص تاريخ الانتهاء
     expires_at = key_data.get("expires_at")
     if expires_at:
         exp_date = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
         if datetime.now() > exp_date:
             return jsonify({"success": False, "message": "Key has expired"})
 
-    # فحص ربط الجهاز (HWID)
     saved_hwid = key_data.get("hwid")
     
     if saved_hwid is None:
@@ -269,11 +277,11 @@ def check_key():
             key_data["hwid"] = hwid
             save_db(db)
         else:
-            return jsonify({"success": False, "message": "HWID required for first activation"})
+            return jsonify({"success": False, "message": "Verification failed"})
     elif saved_hwid != hwid:
-        return jsonify({"success": False, "message": "Key is bound to another device"})
+        return jsonify({"success": False, "message": "Device mismatch"})
     
-    return jsonify({"success": True, "message": "Key is valid"})
+    return jsonify({"success": True, "message": "Success"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
