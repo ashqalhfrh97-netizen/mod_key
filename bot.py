@@ -32,6 +32,15 @@ def save_db(data):
     except Exception as e:
         print("Save error:", e)
 
+# دالة مساعدة لترجيع JSON باللغة العربية الواضحة بدون ترميز الحروف
+def arabic_json(data, status=200):
+    response = app.response_class(
+        response=json.dumps(data, ensure_ascii=False),
+        status=status,
+        mimetype='application/json'
+    )
+    return response
+
 @app.route("/", methods=["GET", "POST"])
 def admin_panel():
     error = None
@@ -115,9 +124,11 @@ def admin_panel():
                 * { box-sizing: border-box; }
                 body {
                     font-family: Tahoma, sans-serif;
-                    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-                    background-size: 400% 400%;
-                    animation: gradientBG 10s ease infinite;
+                    /* خلفية صورة أنمي مع تغميق خفيف لتظهر بشكل رهيب */
+                    background: linear-gradient(rgba(0,0,0,0.7), rgba(0,0,0,0.7)), url('https://images.unsplash.com/photo-1578632767115-351597cf2477?q=80&w=1000&auto=format&fit=crop');
+                    background-size: cover;
+                    background-position: center;
+                    background-attachment: fixed;
                     color: #fff;
                     display: flex;
                     justify-content: center;
@@ -125,23 +136,18 @@ def admin_panel():
                     height: 100vh;
                     margin: 0;
                 }
-                @keyframes gradientBG {
-                    0% { background-position: 0% 50%; }
-                    50% { background-position: 100% 50%; }
-                    100% { background-position: 0% 50%; }
-                }
                 .login-card {
                     background: rgba(20, 20, 30, 0.85);
                     backdrop-filter: blur(12px);
                     -webkit-backdrop-filter: blur(12px);
                     padding: 30px;
                     border-radius: 12px;
-                    box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+                    box-shadow: 0 8px 32px rgba(0,0,0,0.8);
                     width: 320px;
                     text-align: center;
-                    border: 1px solid rgba(255,255,255,0.1);
+                    border: 1px solid rgba(255,255,255,0.15);
                 }
-                h2 { color: #4CAF50; margin-bottom: 20px; }
+                h2 { color: #4CAF50; margin-bottom: 20px; text-shadow: 0 0 10px rgba(76,175,80,0.5); }
                 input {
                     width: 100%;
                     padding: 12px;
@@ -197,18 +203,15 @@ def admin_panel():
             * { box-sizing: border-box; }
             body {
                 font-family: Tahoma, sans-serif;
-                background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-                background-size: 400% 400%;
-                animation: gradientBG 15s ease infinite;
+                /* خلفية صورة أنمي فخمة للوحة التحكم */
+                background: linear-gradient(rgba(0,0,0,0.75), rgba(0,0,0,0.75)), url('https://images.unsplash.com/photo-1578632767115-351597cf2477?q=80&w=1000&auto=format&fit=crop');
+                background-size: cover;
+                background-position: center;
+                background-attachment: fixed;
                 color: #fff;
                 padding: 20px;
                 margin: 0;
                 min-height: 100vh;
-            }
-            @keyframes gradientBG {
-                0% { background-position: 0% 50%; }
-                50% { background-position: 100% 50%; }
-                100% { background-position: 0% 50%; }
             }
             .header {
                 display: flex;
@@ -219,18 +222,18 @@ def admin_panel():
                 flex-wrap: wrap;
                 gap: 10px;
             }
-            h1 { color: #4CAF50; margin: 0; text-shadow: 0 0 10px rgba(76,175,80,0.4); font-size: 22px; }
+            h1 { color: #4CAF50; margin: 0; text-shadow: 0 0 10px rgba(76,175,80,0.5); font-size: 22px; }
             .logout-btn { background: #f44336; color: white; border: none; padding: 8px 15px; border-radius: 5px; cursor: pointer; font-size: 14px; }
             .card {
-                background: rgba(20, 20, 30, 0.85);
+                background: rgba(20, 20, 30, 0.88);
                 backdrop-filter: blur(12px);
                 -webkit-backdrop-filter: blur(12px);
                 padding: 20px;
                 margin: 0 auto 20px auto;
                 max-width: 900px;
                 border-radius: 10px;
-                box-shadow: 0 8px 25px rgba(0,0,0,0.5);
-                border: 1px solid rgba(255,255,255,0.08);
+                box-shadow: 0 8px 25px rgba(0,0,0,0.7);
+                border: 1px solid rgba(255,255,255,0.12);
                 overflow-x: auto;
             }
             button { background: #4CAF50; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 15px; font-weight: bold; transition: 0.3s; }
@@ -240,7 +243,7 @@ def admin_panel():
             .delete-btn { background: #f44336; padding: 5px 10px; font-size: 13px; }
             .delete-btn:hover { background: #d32f2f; }
             table { width: 100%; border-collapse: collapse; margin-top: 15px; min-width: 600px; }
-            th, td { border: 1px solid #333; padding: 10px; text-align: center; font-size: 14px; }
+            th, td { border: 1px solid #444; padding: 10px; text-align: center; font-size: 14px; }
             th { background: rgba(15,15,25,0.95); color: #4CAF50; }
             select, input { padding: 9px; border-radius: 5px; border: 1px solid #444; background: #111; color: #fff; margin-left: 5px; margin-bottom: 10px; }
             .form-group { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
@@ -327,30 +330,30 @@ def admin_panel():
     """
     return render_template_string(html_panel, keys=db)
 
-# مسار التحقق للمود (رسائل عربية واضحة)
+# مسار التحقق للمود مع إصلاح ظهور الحروف العربية بشكل صحيح تماماً
 @app.route("/check", methods=["POST", "GET"])
 def check_key():
     key = request.form.get("key") or request.args.get("key")
     hwid = request.form.get("hwid") or request.args.get("hwid")
     
     if not key:
-        return jsonify({"success": False, "message": "الرجاء إدخال المفتاح"}), 400
+        return arabic_json({"success": False, "message": "الرجاء إدخال المفتاح"}, 400)
 
     db = load_db()
     
     if key not in db:
-        return jsonify({"success": False, "message": "المفتاح خطأ أو غير موجود"})
+        return arabic_json({"success": False, "message": "المفتاح خطأ أو غير موجود"})
     
     key_data = db[key]
     
     if not key_data.get("active", False):
-        return jsonify({"success": False, "message": "تم ايقاف هذا المفتاح"})
+        return arabic_json({"success": False, "message": "تم ايقاف هذا المفتاح"})
     
     expires_at = key_data.get("expires_at")
     if expires_at:
         exp_date = datetime.strptime(expires_at, "%Y-%m-%d %H:%M:%S")
         if datetime.now() > exp_date:
-            return jsonify({"success": False, "message": "انتهت صلاحية المفتاح"})
+            return arabic_json({"success": False, "message": "انتهت صلاحية المفتاح"})
 
     saved_hwid = key_data.get("hwid")
     
@@ -359,11 +362,11 @@ def check_key():
             key_data["hwid"] = hwid
             save_db(db)
         else:
-            return jsonify({"success": False, "message": "خطأ في بيانات الجهاز"})
+            return arabic_json({"success": False, "message": "خطأ في بيانات الجهاز"})
     elif saved_hwid != hwid:
-        return jsonify({"success": False, "message": "تم استخدام الكود على جهاز آخر"})
+        return arabic_json({"success": False, "message": "تم استخدام الكود على جهاز آخر"})
     
-    return jsonify({"success": True, "message": "تم التفعيل بنجاح"})
+    return arabic_json({"success": True, "message": "تم التفعيل بنجاح"})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
