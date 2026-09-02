@@ -15,7 +15,7 @@ from flask import Flask, request, jsonify
 BOT_TOKEN = "8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc"
 ADMIN_ID = 8299101176
 
-TELEGRAM_API = f"https://modkey-production-0d27.up.railway.app"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KEYS_FILE = os.path.join(BASE_DIR, "keys.json")
@@ -93,16 +93,37 @@ def update_expired_keys():
 
 app = Flask(__name__)
 
-@app.route('/check.php', methods=['POST'])
-@app.route('/check', methods=['POST'])
+@app.route('/check', methods=['POST', 'GET'])
 def api_check_key():
     try:
         update_expired_keys()
         
-        # استقبال المفتاح من طلب المود مينو
-        key = request.form.get('key', '').strip()
+        # محاولة قراءة المفتاح من كل الأماكن الممكنة (Form, Args, JSON, Data)
+        key = ""
+        if request.form:
+            key = request.form.get('key', '') or request.form.get('code', '') or request.form.get('serial', '')
+        if not key and request.args:
+            key = request.args.get('key', '') or request.args.get('code', '') or request.args.get('serial', '')
         if not key:
-            key = request.args.get('key', '').strip()
+            try:
+                data_json = request.get_json(silent=True) or {}
+                if isinstance(data_json, dict):
+                    key = data_json.get('key', '') or data_json.get('code', '') or data_json.get('serial', '')
+            except:
+                pass
+        if not key:
+            try:
+                raw_data = request.data.decode('utf-8', errors='ignore')
+                if raw_data:
+                    if raw_data.startswith('{'):
+                        parsed = json.loads(raw_data)
+                        key = parsed.get('key', '') or parsed.get('code', '')
+                    else:
+                        key = raw_data.strip()
+            except:
+                pass
+
+        key = str(key).strip()
 
         if not key:
             return jsonify({"success": False, "message": "No key provided"})
@@ -132,8 +153,7 @@ def api_check_key():
 
 
 def run_web_server():
-    # Render يتطلب الاستماع على البورت 10000 أو المخصص من البيئة
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host='0.0.0.0', port=port)
 
 
@@ -154,12 +174,11 @@ def send_message(chat_id, text, keyboard=None):
         }
 
     try:
-        r = requests.post(
+        requests.post(
             TELEGRAM_API + "sendMessage",
             json=data,
             timeout=20
         )
-        print("SEND:", r.text)
     except Exception as e:
         print("TELEGRAM SEND ERROR:", repr(e))
 
@@ -280,7 +299,6 @@ def main():
             data = response.json()
 
             if not data.get("ok", False):
-                print("Telegram error:", data)
                 time.sleep(3)
                 continue
 
@@ -296,8 +314,6 @@ def main():
                 chat_id = message["chat"]["id"]
                 user_id = message["from"]["id"]
                 text = message.get("text", "").strip()
-
-                print("Received:", repr(text))
 
                 if user_id != ADMIN_ID:
                     send_message(
@@ -500,10 +516,8 @@ def main():
 
 
 if __name__ == "__main__":
-    # تشغيل سيرفر الويب في خلفية منفصلة حتى لا يعطل بوت التيليجرام
     server_thread = threading.Thread(target=run_web_server)
     server_thread.daemon = True
     server_thread.start()
 
-    # تشغيل بوت التيليجرام
     main()
