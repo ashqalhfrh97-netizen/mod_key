@@ -1,39 +1,52 @@
-import requests
-import json
 import os
+import json
 import random
 import string
 import time
 import threading
 from datetime import datetime, timedelta, timezone
+
+import requests
 from flask import Flask, request, jsonify
 
 
 # =========================================================
-# إعدادات البوت
+# إعدادات Railway
 # =========================================================
 
-# ضع التوكن في Environment Variables
-# BOT_TOKEN=ضع_التوكن_الجديد_هنا
 BOT_TOKEN = os.environ.get("8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc", "").strip()
 
-# ضع ID الأدمن في Environment Variables
-# ADMIN_ID=8299101176
 try:
-    ADMIN_ID = int(os.environ.get("ADMIN_ID", "8299101176"))
+    ADMIN_ID = int(
+        os.environ.get(
+            "ADMIN_ID",
+            "8299101176"
+        )
+    )
 except ValueError:
     ADMIN_ID = 8299101176
 
 
-# رابط API
-TELEGRAM_API = os.environ.get(
-    "TELEGRAM_API",
-    "https://modkey-production-0d27.up.railway.app"
-).rstrip("/")
+# Telegram الرسمي
+TELEGRAM_API = (
+    f"https://api.telegram.org/bot{8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc}"
+)
+
+
+# Railway يعطي PORT تلقائيًا
+try:
+    PORT = int(
+        os.environ.get(
+            "PORT",
+            "8080"
+        )
+    )
+except ValueError:
+    PORT = 8080
 
 
 # =========================================================
-# إعدادات الملفات
+# الملفات
 # =========================================================
 
 BASE_DIR = os.path.dirname(
@@ -55,10 +68,8 @@ HTTP_TIMEOUT = 30
 states = {}
 custom_data = {}
 
-# منع تعارض قراءة وكتابة قاعدة البيانات
 keys_lock = threading.RLock()
 
-# Session واحدة للطلبات
 session = requests.Session()
 
 
@@ -67,25 +78,28 @@ session = requests.Session()
 # =========================================================
 
 if not BOT_TOKEN:
-    print("WARNING: BOT_TOKEN غير موجود.")
-    print("أضف BOT_TOKEN في Environment Variables.")
+
+    print(
+        "ERROR: BOT_TOKEN غير موجود!"
+    )
+
+    print(
+        "أضف BOT_TOKEN في Railway Variables."
+    )
 
 
 # =========================================================
 # الوقت
 # =========================================================
 
-def get_now():
-    """
-    الحصول على الوقت الحالي بصيغة UTC.
-    """
-    return datetime.now(timezone.utc)
+def now_utc():
+    return datetime.now(
+        timezone.utc
+    )
 
 
 def format_datetime(dt):
-    """
-    تحويل التاريخ إلى نص واضح.
-    """
+
     if not dt:
         return "-"
 
@@ -95,25 +109,19 @@ def format_datetime(dt):
 
 
 def parse_datetime(value):
-    """
-    قراءة التاريخ من JSON.
-
-    يدعم:
-    - ISO format
-    - الصيغة القديمة:
-      YYYY-MM-DD HH:MM:SS
-    """
 
     if not value:
         return None
 
-    # الصيغة الجديدة
+    # ISO
     try:
+
         dt = datetime.fromisoformat(
             value
         )
 
         if dt.tzinfo is None:
+
             dt = dt.replace(
                 tzinfo=timezone.utc
             )
@@ -125,6 +133,7 @@ def parse_datetime(value):
 
     # الصيغة القديمة
     try:
+
         dt = datetime.strptime(
             value,
             "%Y-%m-%d %H:%M:%S"
@@ -135,6 +144,7 @@ def parse_datetime(value):
         )
 
     except Exception:
+
         return None
 
 
@@ -143,14 +153,10 @@ def parse_datetime(value):
 # =========================================================
 
 def save_keys(keys):
-    """
-    حفظ المفاتيح في keys.json.
 
-    يتم استخدام ملف مؤقت لتقليل احتمالية
-    تلف الملف إذا توقف البرنامج أثناء الحفظ.
-    """
-
-    temp_file = KEYS_FILE + ".tmp"
+    temp_file = (
+        KEYS_FILE + ".tmp"
+    )
 
     try:
 
@@ -170,9 +176,11 @@ def save_keys(keys):
             f.flush()
 
             try:
+
                 os.fsync(
                     f.fileno()
                 )
+
             except Exception:
                 pass
 
@@ -189,20 +197,20 @@ def save_keys(keys):
         )
 
         try:
+
             if os.path.exists(
                 temp_file
             ):
+
                 os.remove(
                     temp_file
                 )
+
         except Exception:
             pass
 
 
 def load_keys():
-    """
-    تحميل المفاتيح من keys.json.
-    """
 
     with keys_lock:
 
@@ -211,7 +219,9 @@ def load_keys():
             if not os.path.exists(
                 KEYS_FILE
             ):
+
                 save_keys({})
+
                 return {}
 
             with open(
@@ -226,9 +236,11 @@ def load_keys():
                 data,
                 dict
             ):
+
                 print(
                     "WARNING: keys.json غير صحيح."
                 )
+
                 return {}
 
             return data
@@ -253,18 +265,16 @@ def load_keys():
 
 
 # =========================================================
-# فحص انتهاء المفتاح
+# فحص انتهاء المفاتيح
 # =========================================================
 
 def is_expired(info):
-    """
-    التحقق من انتهاء المفتاح.
-    """
 
     if not isinstance(
         info,
         dict
     ):
+
         return True
 
     expire = parse_datetime(
@@ -272,20 +282,19 @@ def is_expired(info):
     )
 
     if expire is None:
+
         return True
 
-    return get_now() >= expire
+    return now_utc() >= expire
 
 
-def normalize_key_info(info):
-    """
-    التأكد من وجود البيانات الأساسية.
-    """
+def normalize_info(info):
 
     if not isinstance(
         info,
         dict
     ):
+
         return {
             "active": False,
             "expired": True
@@ -305,9 +314,6 @@ def normalize_key_info(info):
 
 
 def update_expired_keys():
-    """
-    تحديث جميع المفاتيح المنتهية.
-    """
 
     with keys_lock:
 
@@ -317,7 +323,7 @@ def update_expired_keys():
 
         for key, raw_info in keys.items():
 
-            info = normalize_key_info(
+            info = normalize_info(
                 raw_info
             )
 
@@ -328,6 +334,7 @@ def update_expired_keys():
                 ) is not False:
 
                     info["active"] = False
+
                     changed = True
 
                 if info.get(
@@ -335,16 +342,20 @@ def update_expired_keys():
                 ) is not True:
 
                     info["expired"] = True
+
                     changed = True
 
         if changed:
-            save_keys(keys)
+
+            save_keys(
+                keys
+            )
 
         return keys
 
 
 # =========================================================
-# إنشاء المفاتيح
+# إنشاء المفتاح
 # =========================================================
 
 def create_key():
@@ -379,24 +390,6 @@ def create_key():
     )
 
 
-def make_expire(
-    days,
-    hours,
-    minutes
-):
-
-    expire_time = (
-        get_now()
-        + timedelta(
-            days=days,
-            hours=hours,
-            minutes=minutes
-        )
-    )
-
-    return expire_time.isoformat()
-
-
 def generate_key(
     chat_id,
     days,
@@ -410,7 +403,7 @@ def generate_key(
 
         send_message(
             chat_id,
-            "❌ عدد الأيام لا يمكن أن يكون سالبًا."
+            "❌ الأيام لا يمكن أن تكون سالبة."
         )
 
         return
@@ -441,7 +434,7 @@ def generate_key(
 
         send_message(
             chat_id,
-            "❌ مدة المفتاح يجب أن تكون أكبر من صفر."
+            "❌ المدة يجب أن تكون أكبر من صفر."
         )
 
         return
@@ -453,9 +446,10 @@ def generate_key(
         key = create_key()
 
         while key in keys:
+
             key = create_key()
 
-        created = get_now()
+        created = now_utc()
 
         expire = (
             created
@@ -483,7 +477,9 @@ def generate_key(
             "expire": expire.isoformat()
         }
 
-        save_keys(keys)
+        save_keys(
+            keys
+        )
 
     send_message(
 
@@ -507,14 +503,22 @@ def generate_key(
 
 
 # =========================================================
-# Telegram API
+# Telegram
 # =========================================================
 
 def telegram_post(
     method,
     data=None,
-    timeout=HTTP_TIMEOUT
+    timeout=30
 ):
+
+    if not BOT_TOKEN:
+
+        print(
+            "BOT_TOKEN غير موجود."
+        )
+
+        return None
 
     url = (
         f"{TELEGRAM_API}/{method}"
@@ -523,8 +527,11 @@ def telegram_post(
     try:
 
         response = session.post(
+
             url,
+
             json=data or {},
+
             timeout=timeout
         )
 
@@ -538,7 +545,7 @@ def telegram_post(
         ):
 
             print(
-                "TELEGRAM API ERROR:",
+                "TELEGRAM ERROR:",
                 result
             )
 
@@ -568,6 +575,59 @@ def telegram_post(
     return None
 
 
+def telegram_get(
+    method,
+    params=None,
+    timeout=40
+):
+
+    if not BOT_TOKEN:
+
+        return None
+
+    url = (
+        f"{TELEGRAM_API}/{method}"
+    )
+
+    try:
+
+        response = session.get(
+
+            url,
+
+            params=params or {},
+
+            timeout=timeout
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.RequestException as e:
+
+        print(
+            "TELEGRAM GET ERROR:",
+            repr(e)
+        )
+
+    except ValueError as e:
+
+        print(
+            "TELEGRAM JSON ERROR:",
+            repr(e)
+        )
+
+    except Exception as e:
+
+        print(
+            "TELEGRAM ERROR:",
+            repr(e)
+        )
+
+    return None
+
+
 def send_message(
     chat_id,
     text,
@@ -575,7 +635,9 @@ def send_message(
 ):
 
     data = {
+
         "chat_id": chat_id,
+
         "text": text
     }
 
@@ -598,11 +660,8 @@ def send_message(
 
 def get_updates(offset=None):
 
-    url = (
-        f"{TELEGRAM_API}/getUpdates"
-    )
-
     params = {
+
         "timeout": 30
     }
 
@@ -610,40 +669,11 @@ def get_updates(offset=None):
 
         params["offset"] = offset
 
-    try:
-
-        response = session.get(
-            url,
-            params=params,
-            timeout=40
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except requests.RequestException as e:
-
-        print(
-            "GET UPDATES HTTP ERROR:",
-            repr(e)
-        )
-
-    except ValueError as e:
-
-        print(
-            "GET UPDATES JSON ERROR:",
-            repr(e)
-        )
-
-    except Exception as e:
-
-        print(
-            "GET UPDATES ERROR:",
-            repr(e)
-        )
-
-    return None
+    return telegram_get(
+        "getUpdates",
+        params,
+        timeout=40
+    )
 
 
 # =========================================================
@@ -721,7 +751,7 @@ def duration_keyboard():
 
 
 # =========================================================
-# إدارة الحالات
+# الحالات
 # =========================================================
 
 def clear_state(chat_id):
@@ -760,11 +790,9 @@ def activate_key(
 
             return
 
-        info = normalize_key_info(
+        info = normalize_info(
             keys[key]
         )
-
-        # لا يمكن تفعيل مفتاح منتهي
 
         if is_expired(info):
 
@@ -772,11 +800,17 @@ def activate_key(
 
             info["expired"] = True
 
-            save_keys(keys)
+            save_keys(
+                keys
+            )
 
             send_message(
+
                 chat_id,
-                "⌛ لا يمكن تفعيل مفتاح منتهي الصلاحية.",
+
+                "⌛ لا يمكن تفعيل "
+                "مفتاح منتهي الصلاحية.",
+
                 main_keyboard()
             )
 
@@ -786,11 +820,16 @@ def activate_key(
 
         info["expired"] = False
 
-        save_keys(keys)
+        save_keys(
+            keys
+        )
 
     send_message(
+
         chat_id,
+
         "✅ تم تفعيل المفتاح.",
+
         main_keyboard()
     )
 
@@ -811,8 +850,11 @@ def deactivate_key(
         if key not in keys:
 
             send_message(
+
                 chat_id,
+
                 "❌ المفتاح غير موجود.",
+
                 main_keyboard()
             )
 
@@ -820,11 +862,16 @@ def deactivate_key(
 
         keys[key]["active"] = False
 
-        save_keys(keys)
+        save_keys(
+            keys
+        )
 
     send_message(
+
         chat_id,
+
         "🔴 تم إيقاف المفتاح.",
+
         main_keyboard()
     )
 
@@ -845,8 +892,11 @@ def delete_key(
         if key not in keys:
 
             send_message(
+
                 chat_id,
+
                 "❌ المفتاح غير موجود.",
+
                 main_keyboard()
             )
 
@@ -854,17 +904,22 @@ def delete_key(
 
         del keys[key]
 
-        save_keys(keys)
+        save_keys(
+            keys
+        )
 
     send_message(
+
         chat_id,
+
         "🗑️ تم حذف المفتاح.",
+
         main_keyboard()
     )
 
 
 # =========================================================
-# معلومات مفتاح
+# معلومات المفتاح
 # =========================================================
 
 def key_information(
@@ -879,18 +934,19 @@ def key_information(
         if key not in keys:
 
             send_message(
+
                 chat_id,
+
                 "❌ المفتاح غير موجود.",
+
                 main_keyboard()
             )
 
             return
 
-        info = normalize_key_info(
+        info = normalize_info(
             keys[key]
         )
-
-        # تحديث حالة انتهاء الصلاحية
 
         if is_expired(info):
 
@@ -898,7 +954,9 @@ def key_information(
 
             info["expired"] = True
 
-            save_keys(keys)
+            save_keys(
+                keys
+            )
 
         if info.get(
             "expired",
@@ -919,19 +977,15 @@ def key_information(
             status = "🔴 متوقف"
 
         created = parse_datetime(
-            info.get("created")
+            info.get(
+                "created"
+            )
         )
 
         expire = parse_datetime(
-            info.get("expire")
-        )
-
-        created_text = (
-            format_datetime(created)
-        )
-
-        expire_text = (
-            format_datetime(expire)
+            info.get(
+                "expire"
+            )
         )
 
         text = (
@@ -943,30 +997,34 @@ def key_information(
             f"الحالة: {status}\n\n"
 
             f"📅 تاريخ الإنشاء:\n"
-            f"{created_text}\n\n"
+            f"{format_datetime(created)}\n\n"
 
             f"🕐 تاريخ الانتهاء:\n"
-            f"{expire_text}"
+            f"{format_datetime(expire)}"
 
         )
 
     send_message(
+
         chat_id,
+
         text,
+
         main_keyboard()
     )
 
 
 # =========================================================
-# إرسال رسائل طويلة
+# إرسال رسالة طويلة
 # =========================================================
 
 def send_long_message(
     chat_id,
     text,
-    keyboard=None,
-    max_length=3500
+    keyboard=None
 ):
+
+    max_length = 3500
 
     if len(text) <= max_length:
 
@@ -993,6 +1051,7 @@ def send_long_message(
         ):
 
             if current:
+
                 chunks.append(
                     current
                 )
@@ -1004,7 +1063,10 @@ def send_long_message(
             current += line
 
     if current:
-        chunks.append(current)
+
+        chunks.append(
+            current
+        )
 
     for index, chunk in enumerate(
         chunks
@@ -1037,21 +1099,26 @@ def list_keys(chat_id):
     if not keys:
 
         send_message(
+
             chat_id,
+
             "📋 لا توجد مفاتيح حاليًا.",
+
             main_keyboard()
         )
 
         return
 
     lines = [
+
         "📋 قائمة المفاتيح",
+
         ""
     ]
 
     for key, raw_info in keys.items():
 
-        info = normalize_key_info(
+        info = normalize_info(
             raw_info
         )
 
@@ -1074,11 +1141,9 @@ def list_keys(chat_id):
             status = "🔴"
 
         expire = parse_datetime(
-            info.get("expire")
-        )
-
-        expire_text = (
-            format_datetime(expire)
+            info.get(
+                "expire"
+            )
         )
 
         lines.append(
@@ -1086,23 +1151,28 @@ def list_keys(chat_id):
         )
 
         lines.append(
-            f"⏰ {expire_text}"
+            f"⏰ {format_datetime(expire)}"
         )
 
         lines.append("")
 
     send_long_message(
+
         chat_id,
+
         "\n".join(lines),
+
         main_keyboard()
     )
 
 
 # =========================================================
-# Flask Web API
+# Flask
 # =========================================================
 
-app = Flask(__name__)
+app = Flask(
+    __name__
+)
 
 
 @app.route(
@@ -1129,39 +1199,35 @@ def home():
 def health():
 
     return jsonify({
+
+        "success": True,
+
         "status": "ok"
+
     })
 
 
 @app.route(
-    "/check.php",
-    methods=["GET", "POST"]
-)
-@app.route(
     "/check",
     methods=["GET", "POST"]
 )
-def api_check_key():
+@app.route(
+    "/check.php",
+    methods=["GET", "POST"]
+)
+def check_key():
 
     try:
 
-        # تحديث المفاتيح المنتهية
-
         update_expired_keys()
 
-        # -------------------------------------
-        # POST Form
-        # -------------------------------------
-
+        # POST form
         key = request.form.get(
             "key",
             ""
         ).strip()
 
-        # -------------------------------------
         # GET
-        # -------------------------------------
-
         if not key:
 
             key = request.args.get(
@@ -1169,10 +1235,7 @@ def api_check_key():
                 ""
             ).strip()
 
-        # -------------------------------------
         # JSON
-        # -------------------------------------
-
         if (
             not key
             and request.is_json
@@ -1189,10 +1252,6 @@ def api_check_key():
                 )
             ).strip()
 
-        # -------------------------------------
-        # لا يوجد مفتاح
-        # -------------------------------------
-
         if not key:
 
             return jsonify({
@@ -1202,10 +1261,6 @@ def api_check_key():
                 "message": "No key provided"
 
             }), 400
-
-        # -------------------------------------
-        # البحث عن المفتاح
-        # -------------------------------------
 
         with keys_lock:
 
@@ -1221,21 +1276,20 @@ def api_check_key():
 
                 })
 
-            info = normalize_key_info(
+            info = normalize_info(
                 keys[key]
             )
 
-            # ---------------------------------
-            # انتهاء المفتاح
-            # ---------------------------------
-
+            # منتهي
             if is_expired(info):
 
                 info["active"] = False
 
                 info["expired"] = True
 
-                save_keys(keys)
+                save_keys(
+                    keys
+                )
 
                 return jsonify({
 
@@ -1245,10 +1299,7 @@ def api_check_key():
 
                 })
 
-            # ---------------------------------
-            # المفتاح فعال
-            # ---------------------------------
-
+            # صالح
             if (
                 info.get(
                     "active",
@@ -1268,10 +1319,7 @@ def api_check_key():
 
                 })
 
-            # ---------------------------------
-            # المفتاح متوقف
-            # ---------------------------------
-
+            # متوقف
             return jsonify({
 
                 "success": False,
@@ -1327,6 +1375,7 @@ def handle_message(message):
         chat_id is None
         or user_id is None
     ):
+
         return
 
     text = message.get(
@@ -1335,27 +1384,27 @@ def handle_message(message):
     ).strip()
 
     print(
-        "Received:",
-        repr(text),
-        "from:",
-        user_id
+        f"Received from {user_id}: {text}"
     )
 
     # =====================================================
-    # التحقق من الأدمن
+    # حماية الأدمن
     # =====================================================
 
     if user_id != ADMIN_ID:
 
         send_message(
+
             chat_id,
+
             "⛔ ليس لديك صلاحية استخدام هذا البوت."
+
         )
 
         return
 
     # =====================================================
-    # /start
+    # START
     # =====================================================
 
     if text == "/start":
@@ -1403,7 +1452,9 @@ def handle_message(message):
 
     if text == "🔑 إنشاء مفتاح":
 
-        states[chat_id] = "duration"
+        states[
+            chat_id
+        ] = "duration"
 
         custom_data.pop(
             chat_id,
@@ -1476,20 +1527,30 @@ def handle_message(message):
 
         if text == "🛠️ مدة مخصصة":
 
-            states[chat_id] = "days"
+            states[
+                chat_id
+            ] = "days"
 
-            custom_data[chat_id] = {}
+            custom_data[
+                chat_id
+            ] = {}
 
             send_message(
+
                 chat_id,
+
                 "📅 اكتب عدد الأيام:"
+
             )
 
             return
 
         send_message(
+
             chat_id,
+
             "❌ اختر مدة من الأزرار.",
+
             duration_keyboard()
         )
 
@@ -1508,6 +1569,7 @@ def handle_message(message):
             days = int(text)
 
             if days < 0:
+
                 raise ValueError
 
             custom_data.setdefault(
@@ -1538,8 +1600,11 @@ def handle_message(message):
         ):
 
             send_message(
+
                 chat_id,
+
                 "❌ اكتب رقمًا صحيحًا للأيام."
+
             )
 
         return
@@ -1560,6 +1625,7 @@ def handle_message(message):
                 hours < 0
                 or hours > 23
             ):
+
                 raise ValueError
 
             custom_data.setdefault(
@@ -1616,6 +1682,7 @@ def handle_message(message):
                 minutes < 0
                 or minutes > 59
             ):
+
                 raise ValueError
 
             data = custom_data.get(
@@ -1805,8 +1872,11 @@ def handle_message(message):
         ] = "info"
 
         send_message(
+
             chat_id,
+
             "🔎 أرسل المفتاح."
+
         )
 
         return
@@ -1843,7 +1913,7 @@ def handle_message(message):
         return
 
     # =====================================================
-    # أمر غير معروف
+    # غير معروف
     # =====================================================
 
     send_message(
@@ -1857,34 +1927,61 @@ def handle_message(message):
 
 
 # =========================================================
-# تشغيل البوت
+# Telegram Polling
 # =========================================================
 
-def main():
+def run_bot():
 
     offset = None
 
     print(
-        "===================================="
+        "========================================"
     )
 
     print(
-        "Moldes Key Bot Started"
+        "Moldes Key Bot"
     )
 
     print(
-        "Telegram API:",
-        TELEGRAM_API
+        "Telegram Polling: ON"
     )
 
     print(
-        "Admin ID:",
-        ADMIN_ID
+        f"Admin ID: {ADMIN_ID}"
     )
 
     print(
-        "===================================="
+        "========================================"
     )
+
+    # اختبار Telegram عند التشغيل
+
+    me = telegram_get(
+        "getMe"
+    )
+
+    if me and me.get(
+        "ok"
+    ):
+
+        bot_user = me.get(
+            "result",
+            {}
+        )
+
+        print(
+            "Bot connected:",
+            bot_user.get(
+                "username",
+                "unknown"
+            )
+        )
+
+    else:
+
+        print(
+            "WARNING: لم يتم الاتصال بـ Telegram."
+        )
 
     while True:
 
@@ -1894,7 +1991,7 @@ def main():
 
             update_expired_keys()
 
-            # الحصول على تحديثات Telegram
+            # جلب الرسائل
 
             data = get_updates(
                 offset
@@ -1912,7 +2009,7 @@ def main():
             ):
 
                 print(
-                    "Telegram error:",
+                    "Telegram API error:",
                     data
                 )
 
@@ -1942,6 +2039,7 @@ def main():
                 )
 
                 if not message:
+
                     continue
 
                 try:
@@ -1957,18 +2055,10 @@ def main():
                         repr(e)
                     )
 
-        except KeyboardInterrupt:
-
-            print(
-                "Bot stopped."
-            )
-
-            break
-
         except Exception as e:
 
             print(
-                "MAIN ERROR:",
+                "BOT ERROR:",
                 repr(e)
             )
 
@@ -1982,7 +2072,7 @@ def main():
 def run_web_server():
 
     print(
-        f"Web server starting on port {PORT}"
+        f"Flask server running on port {PORT}"
     )
 
     app.run(
@@ -1999,31 +2089,12 @@ def run_web_server():
 
 
 # =========================================================
-# PORT
-# =========================================================
-
-try:
-
-    PORT = int(
-        os.environ.get(
-            "PORT",
-            "10000"
-        )
-    )
-
-except ValueError:
-
-    PORT = 10000
-
-
-# =========================================================
 # التشغيل
 # =========================================================
 
 if __name__ == "__main__":
 
-    # تشغيل Flask في Thread منفصل
-
+    # Flask
     server_thread = threading.Thread(
 
         target=run_web_server,
@@ -2034,6 +2105,5 @@ if __name__ == "__main__":
 
     server_thread.start()
 
-    # تشغيل بوت Telegram
-
-    main()
+    # Telegram Bot
+    run_bot()
