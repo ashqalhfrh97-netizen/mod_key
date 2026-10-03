@@ -508,7 +508,11 @@ def api_login():
     key_row, device, error = valid_key_for_device(key_value, hwid, True)
 
     if error:
-        audit("API_LOGIN_FAILED", error, current_client_ip())
+        audit(
+            "API_LOGIN_FAILED",
+            f"key={key_value[:8]}... hwid={hwid[:16]}... client={client_version} reason={error}",
+            current_client_ip()
+        )
         return jsonify({
             "success": False,
             "message": error
@@ -553,7 +557,7 @@ def api_login():
 
     audit(
         "API_LOGIN_OK",
-        f"key={key_value[:8]}... client={client_version}",
+        f"key={key_value[:8]}... hwid={hwid[:16]}... client={client_version}",
         current_client_ip()
     )
 
@@ -719,6 +723,7 @@ def page(title, body):
               <a href="{{ url_for('features_page') }}">Permissions</a>
               <a href="{{ url_for('settings_page') }}">Settings</a>
               <a href="{{ url_for('logs_page') }}">Logs</a>
+            <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
               <a href="{{ url_for('logout') }}">Logout</a>
             </nav>
           </header>
@@ -856,6 +861,7 @@ def dashboard():
 @app.get("/keys")
 @admin_required
 def keys_page():
+    created_key = session.pop("created_key", None)
     with db() as c:
         rows = c.execute("""
             SELECT
@@ -867,6 +873,17 @@ def keys_page():
 
     body = """
     <h1>Keys</h1>
+
+    {% if created_key %}
+    <div class="card created-key-card">
+      <div class="small">NEW ACTIVATION KEY</div>
+      <div class="created-key-row">
+        <code id="newKey">{{ created_key }}</code>
+        <button type="button" class="btn primary" onclick="copyNewKey()">Copy Code</button>
+      </div>
+      <div id="copyStatus" class="small">The new key is ready to copy.</div>
+    </div>
+    {% endif %}
 
     <div class="card">
       <h2>Create Key</h2>
@@ -925,6 +942,31 @@ def keys_page():
     </div>
 
     <script>
+    async function copyNewKey(){
+      const el = document.getElementById('newKey');
+      const status = document.getElementById('copyStatus');
+      if (!el) return;
+      const value = el.textContent.trim();
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(value);
+        } else {
+          const area = document.createElement('textarea');
+          area.value = value;
+          area.style.position = 'fixed';
+          area.style.opacity = '0';
+          document.body.appendChild(area);
+          area.focus();
+          area.select();
+          document.execCommand('copy');
+          area.remove();
+        }
+        if (status) status.textContent = 'Copied successfully.';
+      } catch (e) {
+        if (status) status.textContent = 'Copy failed. Copy the code manually.';
+      }
+    }
+
     function countdown(){
       document.querySelectorAll('[data-exp]').forEach(function(el){
         const end = new Date(el.dataset.exp).getTime();
@@ -972,6 +1014,8 @@ def create_key():
     except sqlite3.IntegrityError:
         return "Key already exists. <a href='/keys'>Back</a>", 409
 
+    session["created_key"] = value
+    session.modified = True
     audit("KEY_CREATED", f"key={value[:8]}...")
     return redirect(url_for("keys_page"))
 
@@ -1205,6 +1249,54 @@ def settings_save():
 
     audit("SETTINGS_UPDATED", "server settings changed")
     return redirect(url_for("settings_page"))
+
+
+@app.get("/login-activity")
+@admin_required
+def login_activity_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT created_at,event,ip,details
+            FROM audit_logs
+            WHERE event IN (
+                'API_LOGIN_OK',
+                'API_LOGIN_FAILED',
+                'ADMIN_LOGIN',
+                'ADMIN_LOGIN_FAILED'
+            )
+            ORDER BY id DESC
+            LIMIT 500
+        """).fetchall()
+
+    body = """
+    <h1>Login Activity</h1>
+    <div class="card">
+      <p class="small">
+        Successful and failed login attempts with IP, masked key,
+        HWID prefix and client version.
+      </p>
+      <div class="table-scroll">
+      <table>
+        <tr><th>Time</th><th>Result</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>
+            {% if r['event'] in ['API_LOGIN_OK','ADMIN_LOGIN'] %}
+              <span class="ok">{{ r['event'] }}</span>
+            {% else %}
+              <span class="bad">{{ r['event'] }}</span>
+            {% endif %}
+          </td>
+          <td><code>{{ r['ip'] or 'unknown' }}</code></td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      </div>
+    </div>
+    """
+    return page("Login Activity", render_template_string(body, rows=rows))
 
 
 @app.get("/logs")
