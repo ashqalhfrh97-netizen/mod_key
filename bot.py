@@ -1,13 +1,13 @@
 import os
 import json
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import secrets
 import hashlib
 import hmac
 import time
 from datetime import datetime, timezone, timedelta
 from functools import wraps
-from contextlib import contextmanager
 from urllib.parse import urlparse
 
 from flask import (
@@ -16,18 +16,11 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-except ImportError:
-    psycopg2 = None
-    RealDictCursor = None
-
 # ============================================================
 # PRIVATE MOD MENU CONTROL SERVER
 # ============================================================
 # Requirements:
-#   pip install flask psycopg2-binary
+#   pip install -r requirements.txt
 #
 # Environment variables:
 #   ADMIN_USER=your_admin_username
@@ -36,15 +29,9 @@ except ImportError:
 #   PORT=8080
 #
 # Optional:
-#   DATABASE_URL=postgresql://...        # REQUIRED on Render for persistence
-#   DB_PATH=modpanel.db                  # SQLite fallback for local use
+#   DATABASE_URL=postgresql://... (Render PostgreSQL Internal Database URL)
 #   SESSION_HOURS=12
 #   API_SESSION_MINUTES=30
-#
-# Render persistence:
-# - Create a Render PostgreSQL database.
-# - Add its Internal Database URL as DATABASE_URL on this service.
-# - Keep DB_PATH only for local SQLite fallback.
 #
 # IMPORTANT:
 # - The server is the source of truth for keys/expiry/permissions.
@@ -75,81 +62,15 @@ app.config.update(
 )
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-DB_PATH = os.environ.get("DB_PATH", "modpanel.db")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "Set DATABASE_URL to your PostgreSQL connection string in Render Environment."
+    )
 API_SESSION_MINUTES = int(os.environ.get("API_SESSION_MINUTES", "30"))
 
-
-class _DBCursor:
-    """Small compatibility wrapper so the rest of the app can use ? placeholders
-    with either SQLite or PostgreSQL."""
-    def __init__(self, conn, cursor, postgres=False):
-        self.conn = conn
-        self.cursor = cursor
-        self.postgres = postgres
-
-    def _sql(self, sql):
-        return sql.replace("?", "%s") if self.postgres else sql
-
-    def execute(self, sql, params=None):
-        if params is None:
-            return self.cursor.execute(self._sql(sql))
-        return self.cursor.execute(self._sql(sql), params)
-
-    def executemany(self, sql, seq):
-        return self.cursor.executemany(self._sql(sql), seq)
-
-    def executescript(self, script):
-        if not self.postgres:
-            return self.cursor.executescript(script)
-        # PostgreSQL accepts multiple statements in one execute call.
-        return self.cursor.execute(script)
-
-    def fetchone(self):
-        return self.cursor.fetchone()
-
-    def fetchall(self):
-        return self.cursor.fetchall()
-
-    def __iter__(self):
-        return iter(self.cursor)
-
-
-@contextmanager
-def db():
-    """Return a DB cursor backed by PostgreSQL when DATABASE_URL is set.
-    SQLite remains available for local development/fallback."""
-    use_postgres = bool(DATABASE_URL)
-    conn = None
-    cur = None
-    try:
-        if use_postgres:
-            if psycopg2 is None:
-                raise RuntimeError(
-                    "DATABASE_URL is set but psycopg2-binary is not installed. "
-                    "Add psycopg2-binary to requirements.txt."
-                )
-            conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
-            conn.autocommit = False
-            cur = conn.cursor(cursor_factory=RealDictCursor)
-        else:
-            conn = sqlite3.connect(DB_PATH, timeout=10)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            cur = conn.cursor()
-
-        wrapper = _DBCursor(conn, cur, use_postgres)
-        yield wrapper
-        conn.commit()
-    except Exception:
-        if conn is not None:
-            conn.rollback()
-        raise
-    finally:
-        if cur is not None:
-            cur.close()
-        if conn is not None:
-            conn.close()
+# Small in-memory rate limiter. For a single private server this is useful.
+# If you later run multiple workers/instances, move rate limiting to Redis.
+RATE_BUCKETS = {}
 
 
 # ============================================================
@@ -183,146 +104,118 @@ def parse_iso(value):
         return None
 
 
+class PostgresDB:
+    """Small compatibility layer so the existing SQLite-style queries work on PostgreSQL."""
+    def __init__(self):
+        self.conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+        finally:
+            self.conn.close()
+        return False
+
+    def execute(self, sql, params=()):
+        sql = sql.strip()
+        # PostgreSQL uses %s placeholders instead of SQLite's ? placeholders.
+        sql = sql.replace("?", "%s")
+        # Translate SQLite's INSERT OR IGNORE into PostgreSQL's equivalent.
+        ignore_insert = sql.upper().startswith("INSERT OR IGNORE INTO ")
+        if ignore_insert:
+            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1)
+            sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        cursor = self.conn.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(sql, params)
+        return cursor
+
+    def executescript(self, script):
+        # The schema contains simple CREATE TABLE statements separated by semicolons.
+        cursor = self.conn.cursor()
+        for statement in script.split(";"):
+            statement = statement.strip()
+            if not statement:
+                continue
+            statement = statement.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+            cursor.execute(statement)
+        cursor.close()
+
+
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return PostgresDB()
 
 
 def init_db():
-    if DATABASE_URL:
-        schema = """
-        CREATE TABLE IF NOT EXISTS settings (
-            name TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS keys (
-            id BIGSERIAL PRIMARY KEY,
-            key TEXT NOT NULL UNIQUE,
-            active INTEGER NOT NULL DEFAULT 1,
-            device_limit INTEGER NOT NULL DEFAULT 1,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            note TEXT DEFAULT ''
-        );
-
-        CREATE TABLE IF NOT EXISTS devices (
-            id BIGSERIAL PRIMARY KEY,
-            key_id BIGINT NOT NULL,
-            hwid TEXT NOT NULL,
-            first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            label TEXT DEFAULT '',
-            UNIQUE(key_id, hwid),
-            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS api_sessions (
-            id BIGSERIAL PRIMARY KEY,
-            token_hash TEXT NOT NULL UNIQUE,
-            key_id BIGINT NOT NULL,
-            hwid TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            revoked INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id BIGSERIAL PRIMARY KEY,
-            created_at TEXT NOT NULL,
-            event TEXT NOT NULL,
-            ip TEXT DEFAULT '',
-            details TEXT DEFAULT ''
-        );
-
-        CREATE TABLE IF NOT EXISTS feature_permissions (
-            feature_id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            min_client_version TEXT DEFAULT '1.0.0'
-        );
-
-        CREATE TABLE IF NOT EXISTS key_permissions (
-            key_id BIGINT NOT NULL,
-            feature_id INTEGER NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY(key_id, feature_id),
-            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE,
-            FOREIGN KEY(feature_id) REFERENCES feature_permissions(feature_id) ON DELETE CASCADE
-        );
-        """
-    else:
-        schema = """
-        CREATE TABLE IF NOT EXISTS settings (
-            name TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS keys (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key TEXT NOT NULL UNIQUE,
-            active INTEGER NOT NULL DEFAULT 1,
-            device_limit INTEGER NOT NULL DEFAULT 1,
-            expires_at TEXT,
-            created_at TEXT NOT NULL,
-            note TEXT DEFAULT ''
-        );
-
-        CREATE TABLE IF NOT EXISTS devices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id INTEGER NOT NULL,
-            hwid TEXT NOT NULL,
-            first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            label TEXT DEFAULT '',
-            UNIQUE(key_id, hwid),
-            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS api_sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_hash TEXT NOT NULL UNIQUE,
-            key_id INTEGER NOT NULL,
-            hwid TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            revoked INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            event TEXT NOT NULL,
-            ip TEXT DEFAULT '',
-            details TEXT DEFAULT ''
-        );
-
-        CREATE TABLE IF NOT EXISTS feature_permissions (
-            feature_id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            min_client_version TEXT DEFAULT '1.0.0'
-        );
-
-        CREATE TABLE IF NOT EXISTS key_permissions (
-            key_id INTEGER NOT NULL,
-            feature_id INTEGER NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY(key_id, feature_id),
-            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE,
-            FOREIGN KEY(feature_id) REFERENCES feature_permissions(feature_id) ON DELETE CASCADE
-        );
-        """
-
     with db() as c:
-        c.executescript(schema)
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS settings (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            device_limit INTEGER NOT NULL DEFAULT 1,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            note TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id INTEGER NOT NULL,
+            hwid TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            label TEXT DEFAULT '',
+            UNIQUE(key_id, hwid),
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS api_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT NOT NULL UNIQUE,
+            key_id INTEGER NOT NULL,
+            hwid TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            event TEXT NOT NULL,
+            ip TEXT DEFAULT '',
+            details TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS feature_permissions (
+            feature_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            min_client_version TEXT DEFAULT '1.0.0'
+        );
+
+        CREATE TABLE IF NOT EXISTS key_permissions (
+            key_id INTEGER NOT NULL,
+            feature_id INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(key_id, feature_id),
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE,
+            FOREIGN KEY(feature_id) REFERENCES feature_permissions(feature_id) ON DELETE CASCADE
+        );
+        """)
 
         defaults = {
             "menu_enabled": "1",
@@ -334,11 +227,12 @@ def init_db():
 
         for k, v in defaults.items():
             c.execute(
-                "INSERT INTO settings(name,value) VALUES(?,?) "
-                "ON CONFLICT(name) DO NOTHING",
+                "INSERT OR IGNORE INTO settings(name,value) VALUES(?,?)",
                 (k, v)
             )
 
+        # These IDs come from the supplied Main.cpp GetFeatureList/Changes.
+        # The server only controls whether a feature is allowed.
         features = [
             (98, "BYPASS V.5.0"),
             (15000, "FPS UNLOCKER"),
@@ -376,10 +270,9 @@ def init_db():
 
         for fid, name in features:
             c.execute("""
-                INSERT INTO feature_permissions
+                INSERT OR IGNORE INTO feature_permissions
                 (feature_id,name,enabled,min_client_version)
                 VALUES(?,?,1,'1.0.0')
-                ON CONFLICT(feature_id) DO NOTHING
             """, (fid, name))
 
 
@@ -501,10 +394,7 @@ def hash_token(token):
 
 
 def current_client_ip():
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()[:100]
-    return (request.remote_addr or "")[:100]
+    return request.headers.get("X-Forwarded-For", request.remote_addr or "")
 
 
 # ============================================================
@@ -1001,7 +891,6 @@ def dashboard():
       <p>Version: <b>{{ version }}</b></p>
       <p>Minimum Client: <b>{{ minver }}</b></p>
       <p>Maintenance: <b>{{ 'ON' if maintenance else 'OFF' }}</b></p>
-      <p>Database: <b class="ok">{{ 'PostgreSQL (persistent)' if database_persistent else 'SQLite (temporary on Render)' }}</b></p>
     </div>
     """
     return page("Dashboard", render_template_string(
@@ -1010,8 +899,7 @@ def dashboard():
         menu_enabled=get_setting("menu_enabled") == "1",
         version=get_setting("menu_version"),
         minver=get_setting("min_client_version"),
-        maintenance=get_setting("maintenance") == "1",
-        database_persistent=bool(DATABASE_URL)
+        maintenance=get_setting("maintenance") == "1"
     ))
 
 
@@ -1168,12 +1056,8 @@ def create_key():
             """, (
                 value, 1, device_limit, expires, iso(now_utc()), note
             ))
-    except Exception as e:
-        # Duplicate keys are the normal integrity-error case. Do not expose
-        # database details to the panel user.
-        if "unique" in str(e).lower() or "duplicate" in str(e).lower():
-            return "Key already exists. <a href='/keys'>Back</a>", 409
-        raise
+    except psycopg2.IntegrityError:
+        return "Key already exists. <a href='/keys'>Back</a>", 409
 
     session["created_key"] = value
     session.modified = True
