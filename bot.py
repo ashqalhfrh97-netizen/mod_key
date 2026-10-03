@@ -295,16 +295,44 @@ def rate_limit(bucket, limit, window_seconds):
 # ============================================================
 
 def csrf_token():
+    """Return a stable CSRF token for the current Flask session."""
     token = session.get("_csrf")
-    if not token:
+
+    # Only create a token when the session does not already contain a
+    # valid token. This prevents the token from changing between pages.
+    if not isinstance(token, str) or len(token) < 32:
         token = secrets.token_urlsafe(32)
         session["_csrf"] = token
+        session.modified = True
+
+    return token
+
+
+def rotate_csrf():
+    """Rotate CSRF after an authentication state change."""
+    token = secrets.token_urlsafe(32)
+    session["_csrf"] = token
+    session.modified = True
     return token
 
 
 def require_csrf():
-    token = request.form.get("csrf") or request.headers.get("X-CSRF-Token")
-    if not token or not hmac.compare_digest(token, session.get("_csrf", "")):
+    """Validate the CSRF token from a form or X-CSRF-Token header."""
+    submitted = request.form.get("csrf")
+    if not submitted:
+        submitted = request.headers.get("X-CSRF-Token")
+
+    stored = session.get("_csrf", "")
+
+    if (
+        not isinstance(submitted, str)
+        or not isinstance(stored, str)
+        or not submitted
+        or not stored
+        or len(submitted) > 512
+        or len(stored) > 512
+        or not hmac.compare_digest(submitted, stored)
+    ):
         abort(400, "Invalid CSRF token")
 
 
@@ -323,6 +351,17 @@ def hash_token(token):
 
 def current_client_ip():
     return request.headers.get("X-Forwarded-For", request.remote_addr or "")
+
+
+# ============================================================
+# CSRF SESSION INITIALIZATION
+# ============================================================
+
+@app.before_request
+def ensure_csrf_session():
+    # Create the CSRF token only when missing/invalid. Do not rotate it
+    # on every request, otherwise forms opened in another page can fail.
+    csrf_token()
 
 
 # ============================================================
@@ -735,5 +774,516 @@ def login_post():
         session.clear()
         session.permanent = True
         session["admin"] = True
-        session["_csrf"] = secrets.token_urlsafe(32)
-        audit(
+        rotate_csrf()
+        audit("ADMIN_LOGIN", "success", current_client_ip())
+        return redirect(url_for("dashboard"))
+
+    audit("ADMIN_LOGIN_FAILED", "invalid credentials", current_client_ip())
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="wrap" style="max-width:450px">
+          <div class="card">
+            <h1>Private Control Panel</h1>
+            <p class="bad">Invalid login</p>
+            <form method="post">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input name="username" required>
+              <input type="password" name="password" required>
+              <button class="btn primary">Login</button>
+            </form>
+          </div>
+        </div>
+        """,
+        csrf=csrf_token()
+    ), 401
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.get("/")
+@admin_required
+def dashboard():
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"]
+        active = c.execute(
+            "SELECT COUNT(*) n FROM keys WHERE active=1"
+        ).fetchone()["n"]
+        devices = c.execute("SELECT COUNT(*) n FROM devices").fetchone()["n"]
+        sessions = c.execute("""
+            SELECT COUNT(*) n FROM api_sessions
+            WHERE revoked=0 AND expires_at>?
+        """, (iso(now_utc()),)).fetchone()["n"]
+
+    body = """
+    <div class="hero">
+      <img src="data:image/gif;base64,R0lGODlhhAMEAYcAAOfv/OTs+uPr+eHp997m9dvk89vj8tbf79Xe7c3X58jT5MXQ4cLO38HM3sDL3b7K3LzI2rvH2brG2LjE17fE1rbD1rbC1bXB1LTB1LK/0rG+0rC90a+90K+80Kq4zKi2yqWzyFXcoFPXnlPWnaOyx1HSm1DQmk/MmU7KmEzHlkm9kki6kUe6kUa3j0a2j0W0jkWzjkSyjUSxjZ6tw5mpv5KjuYakx4WjxoSixY6ftoOhxIKgw4GfwoCewoCewYydtImasoeYsIWXr3+dwH6cv32bvnyavXuZvHqYvHqYu3mXu4OVrXeVuXeVuHaUt3SStXORtXORtHKQtHGPs3GPsniLpHWIonOHoXGFn0OwjEOvjEKti0Kri0CmiD+miD+khz6jh3COsnCOsW+NsG2Lrj6ihmuJrTSKe2qIrGqIq2mHq2mHqmiGqmiGqWeFqWeFqGaEp2WDp2WDpmV6lmR5lGOBpGF/o2B+ol99oF17n117nlx6nlx6nVt5nTB/dy57dWN4lFp4nDB43C14dGJ3k1l3m1h2mlxyjlZ0mFlvjFdui1ZsilVsiU9tkU9tkE5skE5qjUxnikxkgktjgUtigUpigElhf0hgfytzcSpwcClvb0dlikZkiCVma0RihkNhhUJghCRiakdffkZefUVefUFfhERdfEBegz9dgSJeaCJdZ0JbekFaeUBZeT5cgDtZfT5XdzpYfDlXezhWejdVeTlTczVTdzZQcTJQdTJQdDJMbSJcZyFaZiFZZiBYZR9VZB9UYzBOci9Nci5McSxKbyxKbh1QYhtMYCtJbSlHaytGaChGaydFaiZEaCdDZyRCZiNBZiRAYiJAZSE/ZCA+Yx89Yh89YRY9WR88YB07YB07Xx05XRw6Xxw5XRo4XRk3XBk2WhM4Vxg2Wxg1WRc1Whc1WRc0WBY0WRY0WBI0VRYzVxUzWBUyVxQyVxQyVhEzVREyVBMxVhMxVRIwVRIvVBAwVBEvVBEvUxAuUw8uUg8tUgcLEgAAAAAAAAAAAAAAACH/C05FVFNDQVBFMi4wAwEAAAAh+QQACgAAACwAAAAAhAMEAQAI/wD3CRxIsKDBgwgTKlzIsKHDhxAjSpxIsaLFixgzatzIsaPHjyBDihxJsqTJkyhTqlzJsqXLlzBjypxJs6bNmzhz6tzJs6fPn0CDCh1KtKjRo0iTKl3KtKnTp1CjSp1KtarVq1izat3KtavXr2DDih1LtqzZs2jTql3Ltq3bt3Djyp1Lt67du3jz6t3Lt6/fv4ADCx5MuLDhw4gTK17MuLHjx5AjS55MubLly5gza97MubPnz6BDix5NurTp06hTq17NurXr17Bjy549WJDt27hz697Nu7fv38CDCx9OvLjx48iTK1/OvLnz59CjS59Ovbr169iza9++vSn37+DDi/8fT768+fPo06tfz769+99HdeubT7++/fv6guLfzz8/0P4A1qdfgAEOSGB/Bh64X4IK3sdggwL+ByF+D94nn4MOFdgRfblNqGBMHoY4H4giekhiiRCeiOKHMK2YYosusvhSjDK6ROOBKnrY4Y30YYQfbjwSWFKQKA5JpIhGHmkiSUqGmGSTDT4JJY5MThlllVZSOdKRQPI4EYC3ZQngRmKuSGaZJZ6JppMarYlkm24umVGccvpI54tz3nllnlaGeeNDB/qpp31fDpqmRIYeGlGiby7KaJ2APjphoZLuCVGleF6KaY2Rrimoiws1+OmmoW6qKEKmnnpQqo2iyiqkBr3/CmtBsk6qUK2Zroorp7EaOqqZBE34a6q07srmQMYeK1CykDJrK7LOWrpPtNJSy6m1Wi4r6bBucovtt+CGK+645JZr7rnYelumbei26+678MYr77z0fsuunvfWq+++/Pbr778A15tvt4IEbPDBCCes8MIMEznwug83LPHEFFds8cXiqqtkxBh37PHHIIcs8o0cQ1nyyCinrPLKLDN8MpcFtyzzzDTXbPO4LweZ88089+zzz0BvHHOfQwdt9NFIJ620fTvHqPHSUEct9dQVP+1i01RnrfXWXMOLNYpfdy322GSXzWrYIqJt9tpst+02zFOq/fbcdNdt935yi1r03Xz3/+0333krGPjfhBduONCDE5j44Yw37rjIi4O59+OUV245ypH3l/nlnHfu+bub4z3556SXbvq8of84+umst+56uqvTmPrrtNdue5OzMx377bz37nuWudcX/O/EF1/88PMhb/zyzLuuvPLNRy8958/vTqAAF2AwASz6YG9BA6ToQ4A+QdBBHwe16DMHANHow8gFFwAAvyLYw48FfXM0YIEHzswHiAMRcAAh5hMADNBnfO+L3/y8Bz59/C+AAxQffrCnPe6pj30ENOB8xtc9+F3gfhycnghH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" alt="Control Panel">
+      <div class="hero-overlay"><div><h1>Private Control Panel</h1><p>Secure key, device and session management</p></div></div>
+    </div>
+    <div class="grid">
+      <div class="card"><div class="small">Keys</div><div class="stat">{{ total }}</div></div>
+      <div class="card"><div class="small">Active Keys</div><div class="stat">{{ active }}</div></div>
+      <div class="card"><div class="small">Registered Devices</div><div class="stat">{{ devices }}</div></div>
+      <div class="card"><div class="small">Live API Sessions</div><div class="stat">{{ sessions }}</div></div>
+    </div>
+
+    <div class="card">
+      <h2>MOD MENU Status</h2>
+      <p>
+        Enabled:
+        <b class="{{ 'ok' if menu_enabled else 'bad' }}">
+          {{ 'YES' if menu_enabled else 'NO' }}
+        </b>
+      </p>
+      <p>Version: <b>{{ version }}</b></p>
+      <p>Minimum Client: <b>{{ minver }}</b></p>
+      <p>Maintenance: <b>{{ 'ON' if maintenance else 'OFF' }}</b></p>
+    </div>
+    """
+    return page("Dashboard", render_template_string(
+        body,
+        total=total, active=active, devices=devices, sessions=sessions,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        version=get_setting("menu_version"),
+        minver=get_setting("min_client_version"),
+        maintenance=get_setting("maintenance") == "1"
+    ))
+
+
+@app.get("/keys")
+@admin_required
+def keys_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT
+              k.*,
+              (SELECT COUNT(*) FROM devices d WHERE d.key_id=k.id) AS device_count
+            FROM keys k
+            ORDER BY k.id DESC
+        """).fetchall()
+
+    body = """
+    <h1>Keys</h1>
+
+    <div class="card">
+      <h2>Create Key</h2>
+      <form method="post" action="{{ url_for('create_key') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="row">
+          <div>
+            <label>Custom key (optional)</label>
+            <input name="key" placeholder="AK-XXXX-XXXX-XXXX">
+          </div>
+          <div>
+            <label>Device limit</label>
+            <input type="number" name="device_limit" min="1" max="100" value="1">
+          </div>
+          <div>
+            <label>Days (0 = permanent)</label>
+            <input type="number" name="days" min="0" value="30">
+          </div>
+        </div>
+        <input name="note" placeholder="Note">
+        <button class="btn primary">Create</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <table>
+        <tr>
+          <th>Key</th><th>Status</th><th>Devices</th>
+          <th>Expiration</th><th>Actions</th>
+        </tr>
+        {% for r in rows %}
+        <tr>
+          <td><code>{{ r['key'] }}</code><br><span class="small">{{ r['note'] }}</span></td>
+          <td>{{ status(r) }}</td>
+          <td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td>
+          <td>
+            {% if r['expires_at'] %}
+              <span class="countdown" data-exp="{{ r['expires_at'] }}">calculating...</span>
+              <br><span class="small">{{ r['expires_at'] }}</span>
+            {% else %}Permanent{% endif %}
+          </td>
+          <td>
+            <form class="inline" method="post" action="{{ url_for('toggle_key', key_id=r['id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn">{{ 'Disable' if r['active'] else 'Enable' }}</button>
+            </form>
+            <form class="inline" method="post" action="{{ url_for('delete_key', key_id=r['id']) }}"
+                  onsubmit="return confirm('Delete this key and its devices/sessions?')">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn danger">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    <script>
+    function countdown(){
+      document.querySelectorAll('[data-exp]').forEach(function(el){
+        const end = new Date(el.dataset.exp).getTime();
+        let sec = Math.max(0, Math.floor((end-Date.now())/1000));
+        const d=Math.floor(sec/86400); sec%=86400;
+        const h=Math.floor(sec/3600); sec%=3600;
+        const m=Math.floor(sec/60); const s=sec%60;
+        el.textContent = d+'d '+h+'h '+m+'m '+s+'s';
+      });
+    }
+    countdown(); setInterval(countdown,1000);
+    </script>
+    """
+    return page("Keys", render_template_string(
+        body, rows=rows, status=key_status, csrf=csrf_token()
+    ))
+
+
+@app.post("/keys/create")
+@admin_required
+def create_key():
+    require_csrf()
+
+    value = normalize_key(request.form.get("key"))
+    if not value:
+        value = generate_key()
+
+    try:
+        device_limit = max(1, min(100, int(request.form.get("device_limit", "1"))))
+        days = max(0, int(request.form.get("days", "30")))
+    except (TypeError, ValueError):
+        return "Invalid device limit or days. <a href='/keys'>Back</a>", 400
+    note = request.form.get("note", "")[:500]
+
+    expires = None if days == 0 else iso(now_utc() + timedelta(days=days))
+
+    try:
+        with db() as c:
+            c.execute("""
+                INSERT INTO keys(key,active,device_limit,expires_at,created_at,note)
+                VALUES(?,?,?,?,?,?)
+            """, (
+                value, 1, device_limit, expires, iso(now_utc()), note
+            ))
+    except sqlite3.IntegrityError:
+        return "Key already exists. <a href='/keys'>Back</a>", 409
+
+    audit("KEY_CREATED", f"key={value[:8]}...")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/toggle")
+@admin_required
+def toggle_key(key_id):
+    require_csrf()
+    with db() as c:
+        row = c.execute(
+            "SELECT active,key FROM keys WHERE id=?",
+            (key_id,)
+        ).fetchone()
+        if not row:
+            abort(404)
+        new_value = 0 if row["active"] else 1
+        c.execute(
+            "UPDATE keys SET active=? WHERE id=?",
+            (new_value, key_id)
+        )
+        if not new_value:
+            c.execute(
+                "UPDATE api_sessions SET revoked=1 WHERE key_id=?",
+                (key_id,)
+            )
+
+    audit("KEY_TOGGLED", f"key_id={key_id} active={new_value}")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/delete")
+@admin_required
+def delete_key(key_id):
+    require_csrf()
+    with db() as c:
+        c.execute("DELETE FROM keys WHERE id=?", (key_id,))
+    audit("KEY_DELETED", f"key_id={key_id}")
+    return redirect(url_for("keys_page"))
+
+
+@app.get("/devices")
+@admin_required
+def devices_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT d.*, k.key
+            FROM devices d
+            JOIN keys k ON k.id=d.key_id
+            ORDER BY d.last_seen DESC
+        """).fetchall()
+
+    body = """
+    <h1>Devices</h1>
+    <div class="card">
+      <table>
+        <tr><th>Key</th><th>HWID</th><th>First Seen</th><th>Last Seen</th><th>Action</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['key'] }}</td>
+          <td><code>{{ r['hwid'] }}</code></td>
+          <td>{{ r['first_seen'] }}</td>
+          <td>{{ r['last_seen'] }}</td>
+          <td>
+            <form method="post" action="{{ url_for('delete_device', device_id=r['id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn danger">Remove</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("Devices", render_template_string(body, rows=rows, csrf=csrf_token()))
+
+
+@app.post("/devices/<int:device_id>/delete")
+@admin_required
+def delete_device(device_id):
+    require_csrf()
+    with db() as c:
+        row = c.execute(
+            "SELECT key_id,hwid FROM devices WHERE id=?",
+            (device_id,)
+        ).fetchone()
+        if row:
+            c.execute("DELETE FROM devices WHERE id=?", (device_id,))
+            c.execute("""
+                UPDATE api_sessions SET revoked=1
+                WHERE key_id=? AND hwid=?
+            """, (row["key_id"], row["hwid"]))
+    audit("DEVICE_REMOVED", f"device_id={device_id}")
+    return redirect(url_for("devices_page"))
+
+
+@app.get("/features")
+@admin_required
+def features_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM feature_permissions
+            ORDER BY feature_id
+        """).fetchall()
+
+    body = """
+    <h1>MOD MENU Permissions</h1>
+
+    <div class="card">
+      <p>
+        Global status:
+        <b class="{{ 'ok' if menu_enabled else 'bad' }}">
+          {{ 'ENABLED' if menu_enabled else 'DISABLED' }}
+        </b>
+      </p>
+      <p class="small">
+        Disabling a feature here prevents the server from granting that
+        feature permission to new/session-refresh responses.
+      </p>
+    </div>
+
+    <div class="card">
+      <table>
+        <tr><th>ID</th><th>Feature</th><th>Global</th><th>Min Version</th><th>Save</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['feature_id'] }}</td>
+          <td>{{ r['name'] }}</td>
+          <td>
+            <form method="post" action="{{ url_for('feature_update', feature_id=r['feature_id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <select name="enabled">
+                <option value="1" {{ 'selected' if r['enabled'] else '' }}>Enabled</option>
+                <option value="0" {{ 'selected' if not r['enabled'] else '' }}>Disabled</option>
+              </select>
+          </td>
+          <td><input name="min_client_version" value="{{ r['min_client_version'] }}"></td>
+          <td><button class="btn primary">Save</button></form></td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("MOD MENU", render_template_string(
+        body,
+        rows=rows,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        csrf=csrf_token()
+    ))
+
+
+@app.post("/features/<int:feature_id>/update")
+@admin_required
+def feature_update(feature_id):
+    require_csrf()
+    enabled = 1 if request.form.get("enabled") == "1" else 0
+    version = request.form.get("min_client_version", "1.0.0")[:50]
+
+    with db() as c:
+        c.execute("""
+            UPDATE feature_permissions
+            SET enabled=?, min_client_version=?
+            WHERE feature_id=?
+        """, (enabled, version, feature_id))
+
+    audit(
+        "FEATURE_UPDATED",
+        f"id={feature_id} enabled={enabled} min_version={version}"
+    )
+    return redirect(url_for("features_page"))
+
+
+@app.get("/settings")
+@admin_required
+def settings_page():
+    body = """
+    <h1>Server Settings</h1>
+    <div class="card">
+      <form method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>MOD MENU</label>
+        <select name="menu_enabled">
+          <option value="1" {{ 'selected' if menu_enabled else '' }}>Enabled</option>
+          <option value="0" {{ 'selected' if not menu_enabled else '' }}>Disabled</option>
+        </select>
+
+        <label>Maintenance</label>
+        <select name="maintenance">
+          <option value="0" {{ 'selected' if not maintenance else '' }}>OFF</option>
+          <option value="1" {{ 'selected' if maintenance else '' }}>ON</option>
+        </select>
+
+        <label>Menu Version</label>
+        <input name="menu_version" value="{{ version }}">
+
+        <label>Minimum Client Version</label>
+        <input name="min_client_version" value="{{ minver }}">
+
+        <label>Announcement</label>
+        <textarea name="announcement" rows="4">{{ announcement }}</textarea>
+
+        <button class="btn primary">Save Settings</button>
+      </form>
+    </div>
+    """
+    return page("Settings", render_template_string(
+        body,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        maintenance=get_setting("maintenance") == "1",
+        version=get_setting("menu_version", "1.0.0"),
+        minver=get_setting("min_client_version", "1.0.0"),
+        announcement=get_setting("announcement", ""),
+        csrf=csrf_token()
+    ))
+
+
+@app.post("/settings")
+@admin_required
+def settings_save():
+    require_csrf()
+
+    set_setting("menu_enabled", "1" if request.form.get("menu_enabled") == "1" else "0")
+    set_setting("maintenance", "1" if request.form.get("maintenance") == "1" else "0")
+    set_setting("menu_version", request.form.get("menu_version", "1.0.0")[:50])
+    set_setting("min_client_version", request.form.get("min_client_version", "1.0.0")[:50])
+    set_setting("announcement", request.form.get("announcement", "")[:2000])
+
+    # Kill switch: immediately revoke all sessions.
+    if get_setting("menu_enabled") != "1" or get_setting("maintenance") == "1":
+        with db() as c:
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE revoked=0")
+
+    audit("SETTINGS_UPDATED", "server settings changed")
+    return redirect(url_for("settings_page"))
+
+
+@app.get("/logs")
+@admin_required
+def logs_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM audit_logs
+            ORDER BY id DESC LIMIT 300
+        """).fetchall()
+
+    body = """
+    <h1>Audit Logs</h1>
+    <div class="card">
+      <table>
+        <tr><th>Time</th><th>Event</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>{{ r['event'] }}</td>
+          <td>{{ r['ip'] }}</td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("Logs", render_template_string(body, rows=rows, csrf=csrf_token()))
+
+
+# ============================================================
+# SECURITY HEADERS / ERROR RESPONSES
+# ============================================================
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:;"
+    )
+    return response
+
+
+@app.errorhandler(400)
+def bad_request(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": str(e)}), 400
+    message = str(e)
+    if "Invalid CSRF token" in message:
+        return render_template_string(BASE_STYLE + """
+        <div class="wrap login-shell"><div class="card login-card">
+          <h1>Session expired</h1>
+          <p class="small">The security token for this page is no longer valid. Reload the panel and try again.</p>
+          <a class="btn primary" href="{{ url_for('keys_page') }}">Reload Keys</a>
+        </div></div>
+        """), 400
+    return message, 400
+
+
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return "Not found", 404
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+init_db()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8080"))
+    # Host must be 0.0.0.0 for Railway/Render/etc.
+    app.run(host="0.0.0.0", port=port, debug=False)
