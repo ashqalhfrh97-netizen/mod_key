@@ -1,1560 +1,1244 @@
 import os
 import json
-import random
-import string
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify, render_template_string, session, redirect, url_for
+import sqlite3
+import secrets
+import hashlib
+import hmac
+import time
+from datetime import datetime, timezone, timedelta
+from functools import wraps
+from urllib.parse import urlparse
+
+from flask import (
+    Flask, request, jsonify, session, redirect,
+    url_for, render_template_string, abort, make_response
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+
+# ============================================================
+# PRIVATE MOD MENU CONTROL SERVER
+# ============================================================
+# Requirements:
+#   pip install flask
+#
+# Environment variables:
+#   ADMIN_USER=your_admin_username
+#   ADMIN_PASS=your_strong_admin_password
+#   SECRET_KEY=a_long_random_secret
+#   PORT=8080
+#
+# Optional:
+#   DB_PATH=modpanel.db
+#   SESSION_HOURS=12
+#   API_SESSION_MINUTES=30
+#
+# IMPORTANT:
+# - The server is the source of truth for keys/expiry/permissions.
+# - Never put ADMIN_PASS or SECRET_KEY inside the APK.
+# - HTTPS should be provided by your host (Railway, Render, etc.).
+# ============================================================
 
 app = Flask(__name__)
-app.secret_key = "ak_team_secret_key_secure"
 
-# =========================
-# بيانات دخول لوحة التحكم
-# =========================
-ADMIN_USER = "X50ASD"
-ADMIN_PASS = "basar2011"
+ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
+SECRET_KEY = os.environ.get("SECRET_KEY", "")
 
-# =========================
-# ملف تخزين المفاتيح
-# =========================
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-KEYS_FILE = os.path.join(BASE_DIR, "keys.json")
-
-
-# =========================
-# تحميل قاعدة البيانات
-# =========================
-def load_db():
-    if not os.path.exists(KEYS_FILE):
-        return {}
-
-    try:
-        with open(KEYS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # حماية إذا كان الملف ليس Dictionary
-        if not isinstance(data, dict):
-            return {}
-
-        return data
-
-    except Exception as e:
-        print("Load error:", e)
-        return {}
-
-
-# =========================
-# حفظ قاعدة البيانات
-# =========================
-def save_db(data):
-    try:
-        temp_file = KEYS_FILE + ".tmp"
-
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(
-                data,
-                f,
-                indent=2,
-                ensure_ascii=False
-            )
-
-        os.replace(temp_file, KEYS_FILE)
-
-    except Exception as e:
-        print("Save error:", e)
-
-
-# =========================
-# JSON عربي
-# =========================
-def arabic_json(data, status=200):
-    response = app.response_class(
-        response=json.dumps(
-            data,
-            ensure_ascii=False
-        ),
-        status=status,
-        mimetype="application/json"
+if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
+    raise RuntimeError(
+        "Set ADMIN_USER, ADMIN_PASS and SECRET_KEY environment variables "
+        "before starting the server."
     )
 
+app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,       # HTTPS in production
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(
+        hours=int(os.environ.get("SESSION_HOURS", "12"))
+    ),
+)
+
+DB_PATH = os.environ.get("DB_PATH", "modpanel.db")
+API_SESSION_MINUTES = int(os.environ.get("API_SESSION_MINUTES", "30"))
+
+# Small in-memory rate limiter. For a single private server this is useful.
+# If you later run multiple workers/instances, move rate limiting to Redis.
+RATE_BUCKETS = {}
+
+
+# ============================================================
+# TIME / JSON HELPERS
+# ============================================================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def iso(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso(value):
+    if not value:
+        return None
+    try:
+        value = value.strip()
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db():
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS settings (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT NOT NULL UNIQUE,
+            active INTEGER NOT NULL DEFAULT 1,
+            device_limit INTEGER NOT NULL DEFAULT 1,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            note TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS devices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id INTEGER NOT NULL,
+            hwid TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            label TEXT DEFAULT '',
+            UNIQUE(key_id, hwid),
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS api_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT NOT NULL UNIQUE,
+            key_id INTEGER NOT NULL,
+            hwid TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            revoked INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            event TEXT NOT NULL,
+            ip TEXT DEFAULT '',
+            details TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS feature_permissions (
+            feature_id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            min_client_version TEXT DEFAULT '1.0.0'
+        );
+
+        CREATE TABLE IF NOT EXISTS key_permissions (
+            key_id INTEGER NOT NULL,
+            feature_id INTEGER NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(key_id, feature_id),
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE,
+            FOREIGN KEY(feature_id) REFERENCES feature_permissions(feature_id) ON DELETE CASCADE
+        );
+        """)
+
+        defaults = {
+            "menu_enabled": "1",
+            "maintenance": "0",
+            "menu_version": "1.0.0",
+            "min_client_version": "1.0.0",
+            "announcement": "",
+        }
+
+        for k, v in defaults.items():
+            c.execute(
+                "INSERT OR IGNORE INTO settings(name,value) VALUES(?,?)",
+                (k, v)
+            )
+
+        # These IDs come from the supplied Main.cpp GetFeatureList/Changes.
+        # The server only controls whether a feature is allowed.
+        features = [
+            (98, "BYPASS V.5.0"),
+            (15000, "FPS UNLOCKER"),
+            (1100, "Kezza Effect"),
+            (1107, "Dog"),
+            (88, "PING AVERAGE"),
+            (106, "Zoom"),
+            (66, "MULTI HIT"),
+            (105, "Unlimited Gauge Skill"),
+            (295, "ATTACK THROUGH WALL"),
+            (1002, "NO FLAG ANIM"),
+            (100, "CANCEL EFFECT"),
+            (3, "NO FALL"),
+            (1105, "FastCapture"),
+            (458, "FlagRange"),
+            (459, "No Status Effect"),
+            (30, "BYPASS WIND"),
+            (29, "NORMAL AURA"),
+            (47, "UNLIMITED AURA"),
+            (120, "Online Long Range"),
+            (4, "SPEED PLAYER"),
+            (90, "FOV ME"),
+            (110, "SPEED GAME"),
+            (456, "PLAYER DASH"),
+            (455, "PlayerScale"),
+            (140, "20X LONG RANGE"),
+            (77, "STOP BOT"),
+            (8901, "Normal Auto Kill"),
+            (8902, "Super Auto Kill"),
+            (231, "Unlimited Fall"),
+            (25, "INVICIBLE"),
+            (33, "SKILL NO CD"),
+            (20, "DISABLE JUMP"),
+        ]
+
+        for fid, name in features:
+            c.execute("""
+                INSERT OR IGNORE INTO feature_permissions
+                (feature_id,name,enabled,min_client_version)
+                VALUES(?,?,1,'1.0.0')
+            """, (fid, name))
+
+
+def audit(event, details="", ip=None):
+    try:
+        with db() as c:
+            c.execute(
+                "INSERT INTO audit_logs(created_at,event,ip,details) VALUES(?,?,?,?)",
+                (iso(now_utc()), event, ip or request.remote_addr or "", details[:2000])
+            )
+    except Exception:
+        pass
+
+
+def get_setting(name, default=None):
+    with db() as c:
+        row = c.execute(
+            "SELECT value FROM settings WHERE name=?",
+            (name,)
+        ).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(name, value):
+    with db() as c:
+        c.execute("""
+            INSERT INTO settings(name,value) VALUES(?,?)
+            ON CONFLICT(name) DO UPDATE SET value=excluded.value
+        """, (name, str(value)))
+
+
+# ============================================================
+# RATE LIMITING
+# ============================================================
+
+def rate_limit(bucket, limit, window_seconds):
+    now = time.time()
+    ip = request.remote_addr or "unknown"
+    key = f"{bucket}:{ip}"
+
+    values = RATE_BUCKETS.get(key, [])
+    values = [x for x in values if now - x < window_seconds]
+
+    if len(values) >= limit:
+        RATE_BUCKETS[key] = values
+        return False
+
+    values.append(now)
+    RATE_BUCKETS[key] = values
+
+    # Prevent this tiny dict from growing forever.
+    if len(RATE_BUCKETS) > 5000:
+        cutoff = now - 3600
+        for k in list(RATE_BUCKETS):
+            RATE_BUCKETS[k] = [x for x in RATE_BUCKETS[k] if x >= cutoff]
+            if not RATE_BUCKETS[k]:
+                RATE_BUCKETS.pop(k, None)
+
+    return True
+
+
+# ============================================================
+# AUTH / CSRF
+# ============================================================
+
+def csrf_token():
+    token = session.get("_csrf")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf"] = token
+    return token
+
+
+def require_csrf():
+    token = request.form.get("csrf") or request.headers.get("X-CSRF-Token")
+    if not token or not hmac.compare_digest(token, session.get("_csrf", "")):
+        abort(400, "Invalid CSRF token")
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not session.get("admin"):
+            return redirect(url_for("login"))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def hash_token(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def current_client_ip():
+    return request.headers.get("X-Forwarded-For", request.remote_addr or "")
+
+
+# ============================================================
+# KEY HELPERS
+# ============================================================
+
+def generate_key():
+    return "AK-" + "-".join(
+        "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(4))
+        for _ in range(3)
+    )
+
+
+def normalize_key(value):
+    return (value or "").strip().upper()
+
+
+def key_status(row):
+    if not row:
+        return "NOT_FOUND"
+    if not row["active"]:
+        return "DISABLED"
+    exp = parse_iso(row["expires_at"])
+    if exp and exp <= now_utc():
+        return "EXPIRED"
+    return "ACTIVE"
+
+
+def valid_key_for_device(key_value, hwid, create_device=True):
+    key_value = normalize_key(key_value)
+    hwid = (hwid or "").strip()
+
+    if not key_value or not hwid:
+        return None, None, "Missing key or device id"
+
+    with db() as c:
+        key_row = c.execute(
+            "SELECT * FROM keys WHERE key=?",
+            (key_value,)
+        ).fetchone()
+
+        if not key_row:
+            return None, None, "Invalid key"
+
+        status = key_status(key_row)
+        if status == "DISABLED":
+            return None, None, "Key disabled"
+        if status == "EXPIRED":
+            return None, None, "Key expired"
+
+        device = c.execute("""
+            SELECT * FROM devices
+            WHERE key_id=? AND hwid=?
+        """, (key_row["id"], hwid)).fetchone()
+
+        device_count = c.execute("""
+            SELECT COUNT(*) AS n FROM devices WHERE key_id=?
+        """, (key_row["id"],)).fetchone()["n"]
+
+        if not device and create_device:
+            if device_count >= key_row["device_limit"]:
+                return None, None, "Device limit reached"
+
+            t = iso(now_utc())
+            c.execute("""
+                INSERT INTO devices(key_id,hwid,first_seen,last_seen)
+                VALUES(?,?,?,?)
+            """, (key_row["id"], hwid, t, t))
+        elif device:
+            c.execute("""
+                UPDATE devices SET last_seen=? WHERE id=?
+            """, (iso(now_utc()), device["id"]))
+
+        return key_row, device, None
+
+
+def feature_map_for_key(key_id):
+    with db() as c:
+        rows = c.execute("""
+            SELECT
+                f.feature_id,
+                f.name,
+                f.enabled AS global_enabled,
+                f.min_client_version,
+                COALESCE(kp.enabled, 1) AS key_enabled
+            FROM feature_permissions f
+            LEFT JOIN key_permissions kp
+              ON kp.feature_id=f.feature_id AND kp.key_id=?
+            ORDER BY f.feature_id
+        """, (key_id,)).fetchall()
+
+    return {
+        str(r["feature_id"]): {
+            "name": r["name"],
+            "enabled": bool(r["global_enabled"] and r["key_enabled"]),
+            "min_client_version": r["min_client_version"],
+        }
+        for r in rows
+    }
+
+
+def menu_payload(key_row):
+    return {
+        "menu_enabled": get_setting("menu_enabled", "1") == "1",
+        "maintenance": get_setting("maintenance", "0") == "1",
+        "menu_version": get_setting("menu_version", "1.0.0"),
+        "min_client_version": get_setting("min_client_version", "1.0.0"),
+        "announcement": get_setting("announcement", ""),
+        "server_time": iso(now_utc()),
+        "expires_at": key_row["expires_at"],
+        "permissions": feature_map_for_key(key_row["id"]),
+    }
+
+
+# ============================================================
+# API
+# ============================================================
+
+@app.get("/api/v1/health")
+def api_health():
+    return jsonify({
+        "success": True,
+        "server": "online",
+        "server_time": iso(now_utc())
+    })
+
+
+@app.post("/api/v1/auth/login")
+def api_login():
+    if not rate_limit("api_login", 12, 60):
+        return jsonify({
+            "success": False,
+            "message": "Too many attempts"
+        }), 429
+
+    data = request.get_json(silent=True) or request.form
+    key_value = normalize_key(data.get("key", ""))
+    hwid = str(data.get("hwid", "")).strip()
+    client_version = str(data.get("client_version", "1.0.0")).strip()
+
+    if len(hwid) > 256:
+        return jsonify({"success": False, "message": "Invalid device id"}), 400
+
+    key_row, device, error = valid_key_for_device(key_value, hwid, True)
+
+    if error:
+        audit("API_LOGIN_FAILED", error, current_client_ip())
+        return jsonify({
+            "success": False,
+            "message": error
+        }), 403
+
+    menu = menu_payload(key_row)
+
+    if not menu["menu_enabled"]:
+        return jsonify({
+            "success": False,
+            "message": "MOD MENU disabled by server",
+            "server_time": menu["server_time"]
+        }), 403
+
+    if menu["maintenance"]:
+        return jsonify({
+            "success": False,
+            "message": "Server maintenance",
+            "server_time": menu["server_time"]
+        }), 503
+
+    # We intentionally do not trust the client version for security.
+    # It is only used to tell the client if an update is required.
+    token = secrets.token_urlsafe(48)
+    token_hash = hash_token(token)
+    created = now_utc()
+    expires = created + timedelta(minutes=API_SESSION_MINUTES)
+
+    with db() as c:
+        c.execute("""
+            INSERT INTO api_sessions
+            (token_hash,key_id,hwid,created_at,expires_at,last_seen)
+            VALUES(?,?,?,?,?,?)
+        """, (
+            token_hash,
+            key_row["id"],
+            hwid,
+            iso(created),
+            iso(expires),
+            iso(created),
+        ))
+
+    audit(
+        "API_LOGIN_OK",
+        f"key={key_value[:8]}... client={client_version}",
+        current_client_ip()
+    )
+
+    return jsonify({
+        "success": True,
+        "session_token": token,
+        "session_expires_at": iso(expires),
+        "key_expires_at": key_row["expires_at"],
+        "server_time": menu["server_time"],
+        "menu_version": menu["menu_version"],
+        "min_client_version": menu["min_client_version"],
+        "permissions": menu["permissions"],
+        "announcement": menu["announcement"],
+    })
+
+
+def require_api_session():
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None, "Missing authorization"
+
+    token = auth[7:].strip()
+    if len(token) < 20 or len(token) > 512:
+        return None, "Invalid session"
+
+    token_hash = hash_token(token)
+
+    with db() as c:
+        row = c.execute("""
+            SELECT
+                s.*,
+                k.key,
+                k.active,
+                k.device_limit,
+                k.expires_at AS key_expires_at
+            FROM api_sessions s
+            JOIN keys k ON k.id=s.key_id
+            WHERE s.token_hash=? AND s.revoked=0
+        """, (token_hash,)).fetchone()
+
+        if not row:
+            return None, "Invalid session"
+
+        session_exp = parse_iso(row["expires_at"])
+        key_exp = parse_iso(row["key_expires_at"])
+
+        if not session_exp or session_exp <= now_utc():
+            c.execute(
+                "UPDATE api_sessions SET revoked=1 WHERE id=?",
+                (row["id"],)
+            )
+            return None, "Session expired"
+
+        if not row["active"]:
+            return None, "Key disabled"
+
+        if key_exp and key_exp <= now_utc():
+            return None, "Key expired"
+
+        # The device must still be registered for the key.
+        device = c.execute("""
+            SELECT id FROM devices
+            WHERE key_id=? AND hwid=?
+        """, (row["key_id"], row["hwid"])).fetchone()
+
+        if not device:
+            return None, "Device not registered"
+
+        c.execute("""
+            UPDATE api_sessions SET last_seen=? WHERE id=?
+        """, (iso(now_utc()), row["id"]))
+
+        return row, None
+
+
+@app.get("/api/v1/session")
+def api_session():
+    row, error = require_api_session()
+    if error:
+        return jsonify({"success": False, "message": error}), 401
+
+    with db() as c:
+        key_row = c.execute(
+            "SELECT * FROM keys WHERE id=?",
+            (row["key_id"],)
+        ).fetchone()
+
+    menu = menu_payload(key_row)
+
+    if not menu["menu_enabled"] or menu["maintenance"]:
+        return jsonify({
+            "success": False,
+            "message": "MOD MENU unavailable",
+            "server_time": menu["server_time"]
+        }), 403
+
+    return jsonify({
+        "success": True,
+        "server_time": menu["server_time"],
+        "session_expires_at": row["expires_at"],
+        "key_expires_at": key_row["expires_at"],
+        "permissions": menu["permissions"],
+        "menu_version": menu["menu_version"],
+        "min_client_version": menu["min_client_version"],
+        "announcement": menu["announcement"],
+    })
+
+
+@app.post("/api/v1/session/logout")
+def api_logout():
+    row, error = require_api_session()
+    if error:
+        return jsonify({"success": False, "message": error}), 401
+
+    auth = request.headers.get("Authorization", "")
+    token_hash = hash_token(auth[7:].strip())
+
+    with db() as c:
+        c.execute(
+            "UPDATE api_sessions SET revoked=1 WHERE token_hash=?",
+            (token_hash,)
+        )
+
+    return jsonify({"success": True, "message": "Logged out"})
+
+
+# ============================================================
+# ADMIN WEB PANEL
+# ============================================================
+
+BASE_STYLE = """
+<style>
+*{box-sizing:border-box}
+body{
+  margin:0;background:#0b0f14;color:#e9eef5;
+  font-family:Arial,sans-serif
+}
+a{color:#78b7ff;text-decoration:none}
+.wrap{max-width:1250px;margin:25px auto;padding:0 15px}
+.card{
+  background:#121923;border:1px solid #263242;border-radius:14px;
+  padding:18px;margin-bottom:15px
+}
+h1,h2{margin-top:0}
+nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:15px}
+nav a,.btn{
+  display:inline-block;padding:9px 12px;border-radius:9px;
+  background:#1b2635;color:#fff;border:1px solid #33445a;
+  cursor:pointer
+}
+.btn.primary{background:#2563eb}
+.btn.danger{background:#9f1239}
+input,select,textarea{
+  width:100%;padding:10px;margin:6px 0 12px;
+  background:#0b1119;color:#fff;border:1px solid #344255;border-radius:8px
+}
+table{width:100%;border-collapse:collapse}
+th,td{padding:10px;border-bottom:1px solid #293442;text-align:left}
+.badge{padding:4px 8px;border-radius:20px;background:#263242}
+.ok{color:#70e19a}.bad{color:#ff7b91}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+.stat{font-size:25px;font-weight:bold}
+.small{color:#93a1b3;font-size:13px}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+form.inline{display:inline}
+</style>
+"""
+
+
+def page(title, body):
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="wrap">
+          <nav>
+            <a href="{{ url_for('dashboard') }}">Dashboard</a>
+            <a href="{{ url_for('keys_page') }}">Keys</a>
+            <a href="{{ url_for('devices_page') }}">Devices</a>
+            <a href="{{ url_for('features_page') }}">MOD MENU</a>
+            <a href="{{ url_for('settings_page') }}">Settings</a>
+            <a href="{{ url_for('logs_page') }}">Logs</a>
+            <a href="{{ url_for('logout') }}">Logout</a>
+          </nav>
+          """ + body + """
+        </div>
+        """,
+        title=title,
+        csrf=csrf_token()
+    )
+
+
+@app.get("/login")
+def login():
+    if session.get("admin"):
+        return redirect(url_for("dashboard"))
+
+    return render_template_string(BASE_STYLE + """
+    <div class="wrap" style="max-width:450px">
+      <div class="card">
+        <h1>Private Control Panel</h1>
+        <p class="small">Administrator login</p>
+        {% if error %}<p class="bad">{{ error }}</p>{% endif %}
+        <form method="post">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <label>Username</label>
+          <input name="username" autocomplete="username" required>
+          <label>Password</label>
+          <input type="password" name="password"
+                 autocomplete="current-password" required>
+          <button class="btn primary" type="submit">Login</button>
+        </form>
+      </div>
+    </div>
+    """, error=None, csrf=csrf_token())
+
+
+@app.post("/login")
+def login_post():
+    if not rate_limit("admin_login", 8, 60):
+        return render_template_string(
+            BASE_STYLE + "<div class='wrap'><div class='card'><p class='bad'>Too many login attempts. Try again later.</p></div></div>"
+        ), 429
+
+    require_csrf()
+
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+
+    if hmac.compare_digest(username, ADMIN_USER) and hmac.compare_digest(password, ADMIN_PASS):
+        session.clear()
+        session.permanent = True
+        session["admin"] = True
+        session["_csrf"] = secrets.token_urlsafe(32)
+        audit("ADMIN_LOGIN", "success", current_client_ip())
+        return redirect(url_for("dashboard"))
+
+    audit("ADMIN_LOGIN_FAILED", "invalid credentials", current_client_ip())
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="wrap" style="max-width:450px">
+          <div class="card">
+            <h1>Private Control Panel</h1>
+            <p class="bad">Invalid login</p>
+            <form method="post">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input name="username" required>
+              <input type="password" name="password" required>
+              <button class="btn primary">Login</button>
+            </form>
+          </div>
+        </div>
+        """,
+        csrf=csrf_token()
+    ), 401
+
+
+@app.get("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.get("/")
+@admin_required
+def dashboard():
+    with db() as c:
+        total = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"]
+        active = c.execute(
+            "SELECT COUNT(*) n FROM keys WHERE active=1"
+        ).fetchone()["n"]
+        devices = c.execute("SELECT COUNT(*) n FROM devices").fetchone()["n"]
+        sessions = c.execute("""
+            SELECT COUNT(*) n FROM api_sessions
+            WHERE revoked=0 AND expires_at>?
+        """, (iso(now_utc()),)).fetchone()["n"]
+
+    body = """
+    <h1>Private Control Panel</h1>
+    <div class="grid">
+      <div class="card"><div class="small">Keys</div><div class="stat">{{ total }}</div></div>
+      <div class="card"><div class="small">Active Keys</div><div class="stat">{{ active }}</div></div>
+      <div class="card"><div class="small">Registered Devices</div><div class="stat">{{ devices }}</div></div>
+      <div class="card"><div class="small">Live API Sessions</div><div class="stat">{{ sessions }}</div></div>
+    </div>
+
+    <div class="card">
+      <h2>MOD MENU Status</h2>
+      <p>
+        Enabled:
+        <b class="{{ 'ok' if menu_enabled else 'bad' }}">
+          {{ 'YES' if menu_enabled else 'NO' }}
+        </b>
+      </p>
+      <p>Version: <b>{{ version }}</b></p>
+      <p>Minimum Client: <b>{{ minver }}</b></p>
+      <p>Maintenance: <b>{{ 'ON' if maintenance else 'OFF' }}</b></p>
+    </div>
+    """
+    return page("Dashboard", render_template_string(
+        body,
+        total=total, active=active, devices=devices, sessions=sessions,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        version=get_setting("menu_version"),
+        minver=get_setting("min_client_version"),
+        maintenance=get_setting("maintenance") == "1"
+    ))
+
+
+@app.get("/keys")
+@admin_required
+def keys_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT
+              k.*,
+              (SELECT COUNT(*) FROM devices d WHERE d.key_id=k.id) AS device_count
+            FROM keys k
+            ORDER BY k.id DESC
+        """).fetchall()
+
+    body = """
+    <h1>Keys</h1>
+
+    <div class="card">
+      <h2>Create Key</h2>
+      <form method="post" action="{{ url_for('create_key') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="row">
+          <div>
+            <label>Custom key (optional)</label>
+            <input name="key" placeholder="AK-XXXX-XXXX-XXXX">
+          </div>
+          <div>
+            <label>Device limit</label>
+            <input type="number" name="device_limit" min="1" max="100" value="1">
+          </div>
+          <div>
+            <label>Days (0 = permanent)</label>
+            <input type="number" name="days" min="0" value="30">
+          </div>
+        </div>
+        <input name="note" placeholder="Note">
+        <button class="btn primary">Create</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <table>
+        <tr>
+          <th>Key</th><th>Status</th><th>Devices</th>
+          <th>Expiration</th><th>Actions</th>
+        </tr>
+        {% for r in rows %}
+        <tr>
+          <td><code>{{ r['key'] }}</code><br><span class="small">{{ r['note'] }}</span></td>
+          <td>{{ status(r) }}</td>
+          <td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td>
+          <td>
+            {% if r['expires_at'] %}
+              <span class="countdown" data-exp="{{ r['expires_at'] }}">calculating...</span>
+              <br><span class="small">{{ r['expires_at'] }}</span>
+            {% else %}Permanent{% endif %}
+          </td>
+          <td>
+            <form class="inline" method="post" action="{{ url_for('toggle_key', key_id=r['id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn">{{ 'Disable' if r['active'] else 'Enable' }}</button>
+            </form>
+            <form class="inline" method="post" action="{{ url_for('delete_key', key_id=r['id']) }}"
+                  onsubmit="return confirm('Delete this key and its devices/sessions?')">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn danger">Delete</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+
+    <script>
+    function countdown(){
+      document.querySelectorAll('[data-exp]').forEach(function(el){
+        const end = new Date(el.dataset.exp).getTime();
+        let sec = Math.max(0, Math.floor((end-Date.now())/1000));
+        const d=Math.floor(sec/86400); sec%=86400;
+        const h=Math.floor(sec/3600); sec%=3600;
+        const m=Math.floor(sec/60); const s=sec%60;
+        el.textContent = d+'d '+h+'h '+m+'m '+s+'s';
+      });
+    }
+    countdown(); setInterval(countdown,1000);
+    </script>
+    """
+    return page("Keys", render_template_string(
+        body, rows=rows, status=key_status
+    ))
+
+
+@app.post("/keys/create")
+@admin_required
+def create_key():
+    require_csrf()
+
+    value = normalize_key(request.form.get("key"))
+    if not value:
+        value = generate_key()
+
+    device_limit = max(1, min(100, int(request.form.get("device_limit", "1"))))
+    days = max(0, int(request.form.get("days", "30")))
+    note = request.form.get("note", "")[:500]
+
+    expires = None if days == 0 else iso(now_utc() + timedelta(days=days))
+
+    try:
+        with db() as c:
+            c.execute("""
+                INSERT INTO keys(key,active,device_limit,expires_at,created_at,note)
+                VALUES(?,?,?,?,?,?)
+            """, (
+                value, 1, device_limit, expires, iso(now_utc()), note
+            ))
+    except sqlite3.IntegrityError:
+        return "Key already exists. <a href='/keys'>Back</a>", 409
+
+    audit("KEY_CREATED", f"key={value[:8]}...")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/toggle")
+@admin_required
+def toggle_key(key_id):
+    require_csrf()
+    with db() as c:
+        row = c.execute(
+            "SELECT active,key FROM keys WHERE id=?",
+            (key_id,)
+        ).fetchone()
+        if not row:
+            abort(404)
+        new_value = 0 if row["active"] else 1
+        c.execute(
+            "UPDATE keys SET active=? WHERE id=?",
+            (new_value, key_id)
+        )
+        if not new_value:
+            c.execute(
+                "UPDATE api_sessions SET revoked=1 WHERE key_id=?",
+                (key_id,)
+            )
+
+    audit("KEY_TOGGLED", f"key_id={key_id} active={new_value}")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/delete")
+@admin_required
+def delete_key(key_id):
+    require_csrf()
+    with db() as c:
+        c.execute("DELETE FROM keys WHERE id=?", (key_id,))
+    audit("KEY_DELETED", f"key_id={key_id}")
+    return redirect(url_for("keys_page"))
+
+
+@app.get("/devices")
+@admin_required
+def devices_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT d.*, k.key
+            FROM devices d
+            JOIN keys k ON k.id=d.key_id
+            ORDER BY d.last_seen DESC
+        """).fetchall()
+
+    body = """
+    <h1>Devices</h1>
+    <div class="card">
+      <table>
+        <tr><th>Key</th><th>HWID</th><th>First Seen</th><th>Last Seen</th><th>Action</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['key'] }}</td>
+          <td><code>{{ r['hwid'] }}</code></td>
+          <td>{{ r['first_seen'] }}</td>
+          <td>{{ r['last_seen'] }}</td>
+          <td>
+            <form method="post" action="{{ url_for('delete_device', device_id=r['id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn danger">Remove</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("Devices", render_template_string(body, rows=rows))
+
+
+@app.post("/devices/<int:device_id>/delete")
+@admin_required
+def delete_device(device_id):
+    require_csrf()
+    with db() as c:
+        row = c.execute(
+            "SELECT key_id,hwid FROM devices WHERE id=?",
+            (device_id,)
+        ).fetchone()
+        if row:
+            c.execute("DELETE FROM devices WHERE id=?", (device_id,))
+            c.execute("""
+                UPDATE api_sessions SET revoked=1
+                WHERE key_id=? AND hwid=?
+            """, (row["key_id"], row["hwid"]))
+    audit("DEVICE_REMOVED", f"device_id={device_id}")
+    return redirect(url_for("devices_page"))
+
+
+@app.get("/features")
+@admin_required
+def features_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM feature_permissions
+            ORDER BY feature_id
+        """).fetchall()
+
+    body = """
+    <h1>MOD MENU Permissions</h1>
+
+    <div class="card">
+      <p>
+        Global status:
+        <b class="{{ 'ok' if menu_enabled else 'bad' }}">
+          {{ 'ENABLED' if menu_enabled else 'DISABLED' }}
+        </b>
+      </p>
+      <p class="small">
+        Disabling a feature here prevents the server from granting that
+        feature permission to new/session-refresh responses.
+      </p>
+    </div>
+
+    <div class="card">
+      <table>
+        <tr><th>ID</th><th>Feature</th><th>Global</th><th>Min Version</th><th>Save</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['feature_id'] }}</td>
+          <td>{{ r['name'] }}</td>
+          <td>
+            <form method="post" action="{{ url_for('feature_update', feature_id=r['feature_id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <select name="enabled">
+                <option value="1" {{ 'selected' if r['enabled'] else '' }}>Enabled</option>
+                <option value="0" {{ 'selected' if not r['enabled'] else '' }}>Disabled</option>
+              </select>
+          </td>
+          <td><input name="min_client_version" value="{{ r['min_client_version'] }}"></td>
+          <td><button class="btn primary">Save</button></form></td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("MOD MENU", render_template_string(
+        body,
+        rows=rows,
+        menu_enabled=get_setting("menu_enabled") == "1"
+    ))
+
+
+@app.post("/features/<int:feature_id>/update")
+@admin_required
+def feature_update(feature_id):
+    require_csrf()
+    enabled = 1 if request.form.get("enabled") == "1" else 0
+    version = request.form.get("min_client_version", "1.0.0")[:50]
+
+    with db() as c:
+        c.execute("""
+            UPDATE feature_permissions
+            SET enabled=?, min_client_version=?
+            WHERE feature_id=?
+        """, (enabled, version, feature_id))
+
+    audit(
+        "FEATURE_UPDATED",
+        f"id={feature_id} enabled={enabled} min_version={version}"
+    )
+    return redirect(url_for("features_page"))
+
+
+@app.get("/settings")
+@admin_required
+def settings_page():
+    body = """
+    <h1>Server Settings</h1>
+    <div class="card">
+      <form method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>MOD MENU</label>
+        <select name="menu_enabled">
+          <option value="1" {{ 'selected' if menu_enabled else '' }}>Enabled</option>
+          <option value="0" {{ 'selected' if not menu_enabled else '' }}>Disabled</option>
+        </select>
+
+        <label>Maintenance</label>
+        <select name="maintenance">
+          <option value="0" {{ 'selected' if not maintenance else '' }}>OFF</option>
+          <option value="1" {{ 'selected' if maintenance else '' }}>ON</option>
+        </select>
+
+        <label>Menu Version</label>
+        <input name="menu_version" value="{{ version }}">
+
+        <label>Minimum Client Version</label>
+        <input name="min_client_version" value="{{ minver }}">
+
+        <label>Announcement</label>
+        <textarea name="announcement" rows="4">{{ announcement }}</textarea>
+
+        <button class="btn primary">Save Settings</button>
+      </form>
+    </div>
+    """
+    return page("Settings", render_template_string(
+        body,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        maintenance=get_setting("maintenance") == "1",
+        version=get_setting("menu_version", "1.0.0"),
+        minver=get_setting("min_client_version", "1.0.0"),
+        announcement=get_setting("announcement", "")
+    ))
+
+
+@app.post("/settings")
+@admin_required
+def settings_save():
+    require_csrf()
+
+    set_setting("menu_enabled", "1" if request.form.get("menu_enabled") == "1" else "0")
+    set_setting("maintenance", "1" if request.form.get("maintenance") == "1" else "0")
+    set_setting("menu_version", request.form.get("menu_version", "1.0.0")[:50])
+    set_setting("min_client_version", request.form.get("min_client_version", "1.0.0")[:50])
+    set_setting("announcement", request.form.get("announcement", "")[:2000])
+
+    # Kill switch: immediately revoke all sessions.
+    if get_setting("menu_enabled") != "1" or get_setting("maintenance") == "1":
+        with db() as c:
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE revoked=0")
+
+    audit("SETTINGS_UPDATED", "server settings changed")
+    return redirect(url_for("settings_page"))
+
+
+@app.get("/logs")
+@admin_required
+def logs_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM audit_logs
+            ORDER BY id DESC LIMIT 300
+        """).fetchall()
+
+    body = """
+    <h1>Audit Logs</h1>
+    <div class="card">
+      <table>
+        <tr><th>Time</th><th>Event</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>{{ r['event'] }}</td>
+          <td>{{ r['ip'] }}</td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("Logs", render_template_string(body, rows=rows))
+
+
+# ============================================================
+# SECURITY HEADERS / ERROR RESPONSES
+# ============================================================
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:;"
+    )
     return response
 
 
-# =========================
-# توليد مفتاح عشوائي
-# =========================
-def generate_key():
-    chars = string.ascii_uppercase + string.digits
+@app.errorhandler(400)
+def bad_request(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": str(e)}), 400
+    return str(e), 400
 
-    while True:
-        key = (
-            "AK-"
-            + "".join(random.choices(chars, k=4))
-            + "-"
-            + "".join(random.choices(chars, k=4))
-            + "-"
-            + "".join(random.choices(chars, k=4))
-        )
 
-        db = load_db()
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return "Not found", 404
 
-        if key not in db:
-            return key
 
+# ============================================================
+# STARTUP
+# ============================================================
 
-# =========================
-# تحويل المفاتيح القديمة
-# =========================
-def normalize_key_data(data):
-    """
-    يحول المفتاح القديم الذي يحتوي على hwid واحد
-    إلى النظام الجديد الذي يستخدم hwids.
-    """
+init_db()
 
-    if not isinstance(data, dict):
-        data = {}
-
-    # إذا كان المفتاح قديم
-    if "hwids" not in data:
-
-        old_hwid = data.get("hwid")
-
-        if old_hwid:
-            data["hwids"] = [old_hwid]
-        else:
-            data["hwids"] = []
-
-    # إزالة hwid القديم منطقياً
-    # ونتركه لو أردت التوافق مع أي نسخة قديمة
-    if "hwid" not in data:
-        data["hwid"] = None
-
-    # الحد الافتراضي للمفاتيح القديمة = جهاز واحد
-    if "device_limit" not in data:
-
-        if data.get("hwid"):
-            data["device_limit"] = 1
-        else:
-            data["device_limit"] = 1
-
-    # حماية
-    try:
-        data["device_limit"] = int(data["device_limit"])
-    except:
-        data["device_limit"] = 1
-
-    if data["device_limit"] < 1:
-        data["device_limit"] = 1
-
-    if not isinstance(data.get("hwids"), list):
-        data["hwids"] = []
-
-    return data
-
-
-# =========================
-# لوحة التحكم
-# =========================
-@app.route("/", methods=["GET", "POST"])
-def admin_panel():
-
-    error = None
-    success = None
-
-    if request.method == "POST":
-
-        action = request.form.get("action")
-
-        # =====================
-        # تسجيل الدخول
-        # =====================
-        if action == "login":
-
-            username = request.form.get(
-                "username",
-                ""
-            ).strip()
-
-            password = request.form.get(
-                "password",
-                ""
-            ).strip()
-
-            if (
-                username == ADMIN_USER
-                and password == ADMIN_PASS
-            ):
-                session["logged_in"] = True
-
-            else:
-                error = "اسم المستخدم أو كلمة المرور غير صحيحة!"
-
-        # =====================
-        # تسجيل الخروج
-        # =====================
-        elif action == "logout":
-
-            session.pop("logged_in", None)
-
-            return redirect(
-                url_for("admin_panel")
-            )
-
-        # =====================
-        # إنشاء مفتاح
-        # =====================
-        elif action == "create":
-
-            if not session.get("logged_in"):
-                return redirect(
-                    url_for("admin_panel")
-                )
-
-            # الكود المخصص
-            custom_key = request.form.get(
-                "custom_key",
-                ""
-            ).strip().upper()
-
-            # عدد الأجهزة
-            try:
-                device_limit = int(
-                    request.form.get(
-                        "device_limit",
-                        "1"
-                    )
-                )
-            except:
-                device_limit = 1
-
-            # حماية
-            if device_limit < 1:
-                device_limit = 1
-
-            # مدة جاهزة
-            preset = request.form.get(
-                "preset_days",
-                "0"
-            )
-
-            # ساعات ودقائق
-            try:
-                hours = float(
-                    request.form.get(
-                        "custom_hours",
-                        0
-                    )
-                )
-            except:
-                hours = 0
-
-            try:
-                minutes = float(
-                    request.form.get(
-                        "custom_minutes",
-                        0
-                    )
-                )
-            except:
-                minutes = 0
-
-            # =====================
-            # تحديد المدة
-            # =====================
-            total_delta = timedelta(0)
-            is_permanent = False
-
-            if preset == "permanent":
-
-                is_permanent = True
-
-            elif preset != "0":
-
-                try:
-                    total_delta = timedelta(
-                        days=float(preset)
-                    )
-                except:
-                    total_delta = timedelta(days=7)
-
-            elif hours > 0 or minutes > 0:
-
-                total_delta = timedelta(
-                    hours=hours,
-                    minutes=minutes
-                )
-
-            else:
-
-                # افتراضي أسبوع
-                total_delta = timedelta(days=7)
-
-            # =====================
-            # إنشاء / اختيار الكود
-            # =====================
-            if custom_key:
-
-                # السماح بحروف وأرقام و -
-                allowed = (
-                    string.ascii_uppercase
-                    + string.digits
-                    + "-"
-                    + "_"
-                )
-
-                if not all(
-                    c in allowed
-                    for c in custom_key
-                ):
-                    error = (
-                        "الكود يحتوي على رموز غير مسموحة!"
-                    )
-
-                elif len(custom_key) < 2:
-                    error = (
-                        "الكود يجب أن يحتوي على حرفين "
-                        "أو أكثر!"
-                    )
-
-                else:
-
-                    key = custom_key
-
-            else:
-
-                key = generate_key()
-
-            # =====================
-            # التأكد من عدم التكرار
-            # =====================
-            if not error:
-
-                db = load_db()
-
-                if key in db:
-
-                    error = (
-                        "هذا المفتاح موجود بالفعل!"
-                    )
-
-                else:
-
-                    if is_permanent:
-
-                        expires_at = None
-
-                    else:
-
-                        expires_at = (
-                            datetime.now()
-                            + total_delta
-                        ).strftime(
-                            "%Y-%m-%d %H:%M:%S"
-                        )
-
-                    db[key] = {
-                        "hwid": None,
-
-                        "hwids": [],
-
-                        "device_limit": device_limit,
-
-                        "active": True,
-
-                        "expires_at": expires_at
-                    }
-
-                    save_db(db)
-
-                    return redirect(
-                        url_for("admin_panel")
-                    )
-
-        # =====================
-        # حذف مفتاح
-        # =====================
-        elif action == "delete":
-
-            if not session.get("logged_in"):
-                return redirect(
-                    url_for("admin_panel")
-                )
-
-            key_to_delete = request.form.get(
-                "key"
-            )
-
-            db = load_db()
-
-            if key_to_delete in db:
-
-                del db[key_to_delete]
-
-                save_db(db)
-
-            return redirect(
-                url_for("admin_panel")
-            )
-
-        # =====================
-        # تفعيل / تعطيل مفتاح
-        # =====================
-        elif action == "toggle":
-
-            if not session.get("logged_in"):
-                return redirect(
-                    url_for("admin_panel")
-                )
-
-            key_to_toggle = request.form.get(
-                "key"
-            )
-
-            db = load_db()
-
-            if key_to_toggle in db:
-
-                db[key_to_toggle] = normalize_key_data(
-                    db[key_to_toggle]
-                )
-
-                db[key_to_toggle]["active"] = not db[
-                    key_to_toggle
-                ].get("active", False)
-
-                save_db(db)
-
-            return redirect(
-                url_for("admin_panel")
-            )
-
-    # =========================
-    # صفحة تسجيل الدخول
-    # =========================
-    if not session.get("logged_in"):
-
-        html_login = """
-        <!DOCTYPE html>
-
-        <html lang="ar" dir="rtl">
-
-        <head>
-
-            <meta charset="UTF-8">
-
-            <meta
-                name="viewport"
-                content="width=device-width, initial-scale=1.0"
-            >
-
-            <title>تسجيل الدخول - AK TEAM</title>
-
-            <style>
-
-                * {
-                    box-sizing: border-box;
-                }
-
-                body {
-
-                    font-family: Tahoma, sans-serif;
-
-                    background:
-                    linear-gradient(
-                        rgba(0,0,0,0.7),
-                        rgba(0,0,0,0.7)
-                    ),
-                    url(
-                        'https://images.unsplash.com/photo-1578632767115-351597cf2477?q=80&w=1000&auto=format&fit=crop'
-                    );
-
-                    background-size: cover;
-
-                    background-position: center;
-
-                    background-attachment: fixed;
-
-                    color: #fff;
-
-                    display: flex;
-
-                    justify-content: center;
-
-                    align-items: center;
-
-                    height: 100vh;
-
-                    margin: 0;
-                }
-
-                .login-card {
-
-                    background:
-                    rgba(20,20,30,0.85);
-
-                    backdrop-filter:
-                    blur(12px);
-
-                    padding: 30px;
-
-                    border-radius: 12px;
-
-                    box-shadow:
-                    0 8px 32px
-                    rgba(0,0,0,0.8);
-
-                    width: 320px;
-
-                    text-align: center;
-
-                    border:
-                    1px solid
-                    rgba(255,255,255,0.15);
-                }
-
-                h2 {
-
-                    color: #4CAF50;
-
-                    margin-bottom: 20px;
-                }
-
-                input {
-
-                    width: 100%;
-
-                    padding: 12px;
-
-                    margin: 10px 0;
-
-                    border-radius: 6px;
-
-                    border: 1px solid #444;
-
-                    background: #111;
-
-                    color: #fff;
-
-                    font-size: 14px;
-                }
-
-                button {
-
-                    background: #4CAF50;
-
-                    color: white;
-
-                    border: none;
-
-                    padding: 12px;
-
-                    width: 100%;
-
-                    border-radius: 6px;
-
-                    cursor: pointer;
-
-                    font-size: 16px;
-
-                    margin-top: 10px;
-
-                    font-weight: bold;
-                }
-
-                .error {
-
-                    color: #ff5252;
-
-                    font-size: 13px;
-
-                    margin-top: 10px;
-                }
-
-            </style>
-
-        </head>
-
-        <body>
-
-            <div class="login-card">
-
-                <h2>
-                    تسجيل دخول المشرف
-                </h2>
-
-                <form method="POST">
-
-                    <input
-                        type="hidden"
-                        name="action"
-                        value="login"
-                    >
-
-                    <input
-                        type="text"
-                        name="username"
-                        placeholder="اسم المستخدم"
-                        required
-                    >
-
-                    <input
-                        type="password"
-                        name="password"
-                        placeholder="كلمة المرور"
-                        required
-                    >
-
-                    <button type="submit">
-                        دخول
-                    </button>
-
-                </form>
-
-                {% if error %}
-
-                <div class="error">
-                    {{ error }}
-                </div>
-
-                {% endif %}
-
-            </div>
-
-        </body>
-
-        </html>
-        """
-
-        return render_template_string(
-            html_login,
-            error=error
-        )
-
-    # =========================
-    # لوحة التحكم
-    # =========================
-    db = load_db()
-
-    # ترتيب / تحويل البيانات
-    for k in list(db.keys()):
-
-        db[k] = normalize_key_data(
-            db[k]
-        )
-
-    save_db(db)
-
-    html_panel = """
-
-    <!DOCTYPE html>
-
-    <html lang="ar" dir="rtl">
-
-    <head>
-
-        <meta charset="UTF-8">
-
-        <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1.0"
-        >
-
-        <title>
-            لوحة تحكم المفاتيح - AK TEAM
-        </title>
-
-        <style>
-
-            * {
-                box-sizing: border-box;
-            }
-
-            body {
-
-                font-family: Tahoma, sans-serif;
-
-                background:
-                linear-gradient(
-                    rgba(0,0,0,0.75),
-                    rgba(0,0,0,0.75)
-                ),
-                url(
-                    'https://images.unsplash.com/photo-1578632767115-351597cf2477?q=80&w=1000&auto=format&fit=crop'
-                );
-
-                background-size: cover;
-
-                background-position: center;
-
-                background-attachment: fixed;
-
-                color: #fff;
-
-                padding: 20px;
-
-                margin: 0;
-
-                min-height: 100vh;
-            }
-
-            .header {
-
-                display: flex;
-
-                justify-content: space-between;
-
-                align-items: center;
-
-                max-width: 1000px;
-
-                margin: 0 auto 20px auto;
-
-                flex-wrap: wrap;
-
-                gap: 10px;
-            }
-
-            h1 {
-
-                color: #4CAF50;
-
-                margin: 0;
-
-                font-size: 22px;
-            }
-
-            .logout-btn {
-
-                background: #f44336;
-
-                color: white;
-
-                border: none;
-
-                padding: 8px 15px;
-
-                border-radius: 5px;
-
-                cursor: pointer;
-            }
-
-            .card {
-
-                background:
-                rgba(20,20,30,0.88);
-
-                backdrop-filter:
-                blur(12px);
-
-                padding: 20px;
-
-                margin:
-                0 auto 20px auto;
-
-                max-width: 1000px;
-
-                border-radius: 10px;
-
-                box-shadow:
-                0 8px 25px
-                rgba(0,0,0,0.7);
-
-                border:
-                1px solid
-                rgba(255,255,255,0.12);
-
-                overflow-x: auto;
-            }
-
-            button {
-
-                background: #4CAF50;
-
-                color: white;
-
-                border: none;
-
-                padding: 10px 20px;
-
-                border-radius: 5px;
-
-                cursor: pointer;
-
-                font-size: 15px;
-
-                font-weight: bold;
-            }
-
-            .copy-btn {
-
-                background: #2196F3;
-
-                padding: 5px 10px;
-
-                font-size: 12px;
-
-                margin-top: 5px;
-            }
-
-            .delete-btn {
-
-                background: #f44336;
-
-                padding: 5px 10px;
-
-                font-size: 13px;
-            }
-
-            .toggle-btn {
-
-                background: #ff9800;
-
-                padding: 5px 10px;
-
-                font-size: 13px;
-
-                margin-bottom: 5px;
-            }
-
-            table {
-
-                width: 100%;
-
-                border-collapse: collapse;
-
-                margin-top: 15px;
-
-                min-width: 850px;
-            }
-
-            th,
-            td {
-
-                border:
-                1px solid #444;
-
-                padding: 10px;
-
-                text-align: center;
-
-                font-size: 13px;
-            }
-
-            th {
-
-                background:
-                rgba(15,15,25,0.95);
-
-                color: #4CAF50;
-            }
-
-            select,
-            input {
-
-                padding: 9px;
-
-                border-radius: 5px;
-
-                border:
-                1px solid #444;
-
-                background: #111;
-
-                color: #fff;
-
-                margin-left: 5px;
-
-                margin-bottom: 10px;
-            }
-
-            .form-group {
-
-                display: flex;
-
-                gap: 10px;
-
-                align-items: center;
-
-                flex-wrap: wrap;
-
-                margin-top: 10px;
-            }
-
-            .device-box {
-
-                background: #111;
-
-                padding: 5px 9px;
-
-                border-radius: 5px;
-
-                display: inline-block;
-            }
-
-            .green {
-                color: #4CAF50;
-            }
-
-            .red {
-                color: #f44336;
-            }
-
-        </style>
-
-        <script>
-
-            function copyKey(text) {
-
-                navigator.clipboard
-                .writeText(text)
-                .then(function() {
-
-                    alert(
-                        "تم نسخ المفتاح بنجاح: "
-                        + text
-                    );
-
-                })
-                .catch(function() {
-
-                    alert("فشل النسخ");
-
-                });
-
-            }
-
-        </script>
-
-    </head>
-
-    <body>
-
-        <div class="header">
-
-            <h1>
-                لوحة تحكم مفاتيح المود - AK TEAM
-            </h1>
-
-            <form
-                method="POST"
-                style="margin:0;"
-            >
-
-                <input
-                    type="hidden"
-                    name="action"
-                    value="logout"
-                >
-
-                <button
-                    type="submit"
-                    class="logout-btn"
-                >
-                    تسجيل الخروج
-                </button>
-
-            </form>
-
-        </div>
-
-
-        <!-- =====================
-             إنشاء مفتاح
-        ====================== -->
-
-        <div class="card">
-
-            <h3>
-                توليد مفتاح جديد
-            </h3>
-
-            <form method="POST">
-
-                <input
-                    type="hidden"
-                    name="action"
-                    value="create"
-                >
-
-                <div class="form-group">
-
-                    <label>
-                        الكود المخصص:
-                    </label>
-
-                    <input
-                        type="text"
-                        name="custom_key"
-                        placeholder="مثال: EX25"
-                        maxlength="64"
-                        style="width:180px;"
-                    >
-
-                    <span>
-                        اتركه فارغاً للتوليد التلقائي
-                    </span>
-
-                </div>
-
-
-                <div class="form-group">
-
-                    <label>
-                        عدد الأجهزة:
-                    </label>
-
-                    <input
-                        type="number"
-                        name="device_limit"
-                        min="1"
-                        value="1"
-                        required
-                        style="width:120px;"
-                    >
-
-                    <span>
-                        مثال: 20 = يسمح لـ 20 جهاز
-                    </span>
-
-                </div>
-
-
-                <div class="form-group">
-
-                    <label>
-                        المدة الجاهزة:
-                    </label>
-
-                    <select name="preset_days">
-
-                        <option value="0">
-                            اختر مدة جاهزة
-                        </option>
-
-                        <option value="0.0416">
-                            ساعة واحدة
-                        </option>
-
-                        <option value="0.1458">
-                            3 ساعات ونصف
-                        </option>
-
-                        <option value="1">
-                            يوم واحد
-                        </option>
-
-                        <option value="3">
-                            3 أيام
-                        </option>
-
-                        <option value="7">
-                            أسبوع
-                        </option>
-
-                        <option value="30">
-                            شهر
-                        </option>
-
-                        <option value="365">
-                            سنة
-                        </option>
-
-                        <option value="permanent">
-                            دائم
-                        </option>
-
-                    </select>
-
-                </div>
-
-
-                <div class="form-group">
-
-                    <label>
-                        مخصص:
-                    </label>
-
-                    ساعات:
-
-                    <input
-                        type="number"
-                        name="custom_hours"
-                        min="0"
-                        value="0"
-                        style="width:80px;"
-                    >
-
-                    دقائق:
-
-                    <input
-                        type="number"
-                        name="custom_minutes"
-                        min="0"
-                        value="0"
-                        style="width:80px;"
-                    >
-
-                </div>
-
-
-                <button type="submit">
-
-                    توليد المفتاح
-
-                </button>
-
-            </form>
-
-        </div>
-
-
-        <!-- =====================
-             المفاتيح
-        ====================== -->
-
-        <div class="card">
-
-            <h3>
-                المفاتيح الحالية
-            </h3>
-
-            <table>
-
-                <tr>
-
-                    <th>
-                        المفتاح
-                    </th>
-
-                    <th>
-                        الحالة
-                    </th>
-
-                    <th>
-                        الأجهزة
-                    </th>
-
-                    <th>
-                        تاريخ الانتهاء
-                    </th>
-
-                    <th>
-                        إجراء
-                    </th>
-
-                </tr>
-
-
-                {% for key, data in keys.items() %}
-
-                <tr>
-
-                    <td>
-
-                        <b>
-                            {{ key }}
-                        </b>
-
-                        <br>
-
-                        <button
-                            type="button"
-                            class="copy-btn"
-                            onclick="copyKey('{{ key }}')"
-                        >
-                            نسخ
-                        </button>
-
-                    </td>
-
-
-                    <td>
-
-                        {% if data.active %}
-
-                            <span class="green">
-                                فعّال
-                            </span>
-
-                        {% else %}
-
-                            <span class="red">
-                                معطل
-                            </span>
-
-                        {% endif %}
-
-                    </td>
-
-
-                    <td>
-
-                        <span class="device-box">
-
-                            {{ data.hwids|length }}
-
-                            /
-
-                            {{ data.device_limit }}
-
-                        </span>
-
-                        <br>
-
-                        {% if data.hwids|length >= data.device_limit %}
-
-                            <small class="red">
-                                الحد مكتمل
-                            </small>
-
-                        {% else %}
-
-                            <small class="green">
-                                متاح
-                            </small>
-
-                        {% endif %}
-
-                    </td>
-
-
-                    <td>
-
-                        {% if data.expires_at %}
-
-                            {{ data.expires_at }}
-
-                        {% else %}
-
-                            <span class="green">
-                                دائم
-                            </span>
-
-                        {% endif %}
-
-                    </td>
-
-
-                    <td>
-
-                        <form
-                            method="POST"
-                            style="margin:0 0 5px 0;"
-                        >
-
-                            <input
-                                type="hidden"
-                                name="action"
-                                value="toggle"
-                            >
-
-                            <input
-                                type="hidden"
-                                name="key"
-                                value="{{ key }}"
-                            >
-
-                            <button
-                                type="submit"
-                                class="toggle-btn"
-                            >
-
-                                {% if data.active %}
-                                    تعطيل
-                                {% else %}
-                                    تفعيل
-                                {% endif %}
-
-                            </button>
-
-                        </form>
-
-
-                        <form
-                            method="POST"
-                            style="margin:0;"
-                        >
-
-                            <input
-                                type="hidden"
-                                name="action"
-                                value="delete"
-                            >
-
-                            <input
-                                type="hidden"
-                                name="key"
-                                value="{{ key }}"
-                            >
-
-                            <button
-                                type="submit"
-                                class="delete-btn"
-                            >
-                                حذف
-                            </button>
-
-                        </form>
-
-                    </td>
-
-                </tr>
-
-                {% endfor %}
-
-            </table>
-
-        </div>
-
-    </body>
-
-    </html>
-
-    """
-
-    return render_template_string(
-        html_panel,
-        keys=db
-    )
-
-
-# =========================================================
-# التحقق من المفتاح
-# =========================================================
-@app.route(
-    "/check",
-    methods=["POST", "GET"]
-)
-def check_key():
-
-    key = (
-        request.form.get("key")
-        or request.args.get("key")
-        or ""
-    ).strip().upper()
-
-    hwid = (
-        request.form.get("hwid")
-        or request.args.get("hwid")
-        or ""
-    ).strip()
-
-    # =========================
-    # التحقق من البيانات
-    # =========================
-    if not key:
-
-        return arabic_json(
-            {
-                "success": False,
-                "code": "MISSING_KEY",
-                "message": "الرجاء إدخال المفتاح"
-            },
-            400
-        )
-
-    if not hwid:
-
-        return arabic_json(
-            {
-                "success": False,
-                "code": "MISSING_HWID",
-                "message": "خطأ في بيانات الجهاز"
-            },
-            400
-        )
-
-    # =========================
-    # تحميل DB
-    # =========================
-    db = load_db()
-
-    # =========================
-    # المفتاح غير موجود
-    # =========================
-    if key not in db:
-
-        return arabic_json(
-            {
-                "success": False,
-                "code": "INVALID_KEY",
-                "message": "المفتاح خطأ أو غير موجود"
-            }
-        )
-
-    # =========================
-    # تجهيز بيانات المفتاح
-    # =========================
-    key_data = normalize_key_data(
-        db[key]
-    )
-
-    # =========================
-    # حالة المفتاح
-    # =========================
-    if not key_data.get(
-        "active",
-        False
-    ):
-
-        return arabic_json(
-            {
-                "success": False,
-                "code": "DISABLED",
-                "message": "تم ايقاف هذا المفتاح"
-            }
-        )
-
-    # =========================
-    # انتهاء الصلاحية
-    # =========================
-    expires_at = key_data.get(
-        "expires_at"
-    )
-
-    if expires_at:
-
-        try:
-
-            exp_date = datetime.strptime(
-                expires_at,
-                "%Y-%m-%d %H:%M:%S"
-            )
-
-            if datetime.now() >= exp_date:
-
-                return arabic_json(
-                    {
-                        "success": False,
-                        "code": "EXPIRED",
-                        "message": "انتهت صلاحية المفتاح"
-                    }
-                )
-
-        except Exception:
-
-            return arabic_json(
-                {
-                    "success": False,
-                    "code": "INVALID_EXPIRY",
-                    "message": "خطأ في تاريخ صلاحية المفتاح"
-                },
-                500
-            )
-
-    # =========================
-    # قائمة الأجهزة
-    # =========================
-    hwids = key_data.get(
-        "hwids",
-        []
-    )
-
-    # إزالة القيم الفارغة والتكرار
-    hwids = list(
-        dict.fromkeys(
-            str(x).strip()
-            for x in hwids
-            if str(x).strip()
-        )
-    )
-
-    # =========================
-    # الجهاز مسجل مسبقاً
-    # =========================
-    if hwid in hwids:
-
-        db[key]["hwids"] = hwids
-
-        save_db(db)
-
-        return arabic_json(
-            {
-                "success": True,
-                "code": "ALREADY_REGISTERED",
-                "message": "تم التفعيل بنجاح",
-                "device_count": len(hwids),
-                "device_limit": key_data["device_limit"]
-            }
-        )
-
-    # =========================
-    # التحقق من عدد الأجهزة
-    # =========================
-    device_limit = key_data.get(
-        "device_limit",
-        1
-    )
-
-    try:
-        device_limit = int(
-            device_limit
-        )
-    except:
-        device_limit = 1
-
-    if device_limit < 1:
-        device_limit = 1
-
-    # =========================
-    # الحد الأقصى وصل
-    # =========================
-    if len(hwids) >= device_limit:
-
-        return arabic_json(
-            {
-                "success": False,
-                "code": "DEVICE_LIMIT",
-                "message": "تم الوصول للحد الأقصى للأجهزة لهذا المفتاح",
-                "device_count": len(hwids),
-                "device_limit": device_limit
-            }
-        )
-
-    # =========================
-    # إضافة الجهاز الجديد
-    # =========================
-    hwids.append(hwid)
-
-    db[key]["hwids"] = hwids
-
-    # للتوافق مع النسخ القديمة
-    if len(hwids) == 1:
-        db[key]["hwid"] = hwids[0]
-    else:
-        db[key]["hwid"] = None
-
-    db[key]["device_limit"] = device_limit
-
-    save_db(db)
-
-    # =========================
-    # نجاح
-    # =========================
-    return arabic_json(
-        {
-            "success": True,
-            "code": "ACTIVATED",
-            "message": "تم التفعيل بنجاح",
-            "device_count": len(hwids),
-            "device_limit": device_limit
-        }
-    )
-
-
-# =========================
-# تشغيل السيرفر
-# =========================
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            8080
-        )
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-        )
+    port = int(os.environ.get("PORT", "8080"))
+    # Host must be 0.0.0.0 for Railway/Render/etc.
+    app.run(host="0.0.0.0", port=port, debug=False)
