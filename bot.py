@@ -1,7 +1,6 @@
 import os
 import json
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sqlite3
 import secrets
 import hashlib
 import hmac
@@ -20,7 +19,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 # PRIVATE MOD MENU CONTROL SERVER
 # ============================================================
 # Requirements:
-#   pip install -r requirements.txt
+#   pip install flask
 #
 # Environment variables:
 #   ADMIN_USER=your_admin_username
@@ -29,7 +28,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 #   PORT=8080
 #
 # Optional:
-#   DATABASE_URL=postgresql://... (Render PostgreSQL Internal Database URL)
+#   DB_PATH=modpanel.db
 #   SESSION_HOURS=12
 #   API_SESSION_MINUTES=30
 #
@@ -41,15 +40,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
-SECRET_KEY = os.environ.get("SECRET_KEY", "")
-
-if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
-    raise RuntimeError(
-        "Set ADMIN_USER, ADMIN_PASS and SECRET_KEY environment variables "
-        "before starting the server."
-    )
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin").strip()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+SECRET_KEY = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
 app.secret_key = SECRET_KEY
 app.config.update(
@@ -61,11 +54,7 @@ app.config.update(
     ),
 )
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-if not DATABASE_URL:
-    raise RuntimeError(
-        "Set DATABASE_URL to your PostgreSQL connection string in Render Environment."
-    )
+DB_PATH = os.environ.get("DB_PATH", "modpanel.db")
 API_SESSION_MINUTES = int(os.environ.get("API_SESSION_MINUTES", "30"))
 
 # Small in-memory rate limiter. For a single private server this is useful.
@@ -104,51 +93,12 @@ def parse_iso(value):
         return None
 
 
-class PostgresDB:
-    """Small compatibility layer so the existing SQLite-style queries work on PostgreSQL."""
-    def __init__(self):
-        self.conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            if exc_type is None:
-                self.conn.commit()
-            else:
-                self.conn.rollback()
-        finally:
-            self.conn.close()
-        return False
-
-    def execute(self, sql, params=()):
-        sql = sql.strip()
-        # PostgreSQL uses %s placeholders instead of SQLite's ? placeholders.
-        sql = sql.replace("?", "%s")
-        # Translate SQLite's INSERT OR IGNORE into PostgreSQL's equivalent.
-        ignore_insert = sql.upper().startswith("INSERT OR IGNORE INTO ")
-        if ignore_insert:
-            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1)
-            sql = sql.rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
-        cursor = self.conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute(sql, params)
-        return cursor
-
-    def executescript(self, script):
-        # The schema contains simple CREATE TABLE statements separated by semicolons.
-        cursor = self.conn.cursor()
-        for statement in script.split(";"):
-            statement = statement.strip()
-            if not statement:
-                continue
-            statement = statement.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
-            cursor.execute(statement)
-        cursor.close()
-
-
 def db():
-    return PostgresDB()
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
 def init_db():
@@ -1056,7 +1006,7 @@ def create_key():
             """, (
                 value, 1, device_limit, expires, iso(now_utc()), note
             ))
-    except psycopg2.IntegrityError:
+    except sqlite3.IntegrityError:
         return "Key already exists. <a href='/keys'>Back</a>", 409
 
     session["created_key"] = value
