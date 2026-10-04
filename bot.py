@@ -40,9 +40,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
-SECRET_KEY = os.environ.get("SECRET_KEY", "")
+ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011")
+SECRET_KEY = os.environ.get("SECRET_KEY", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1")
 
 if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
     raise RuntimeError(
@@ -51,6 +51,13 @@ if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
     )
 
 app.secret_key = SECRET_KEY
+
+# Full-page animated background GIF. You can replace this URL later
+# without changing the rest of the application.
+ANIME_GIF_URL = os.environ.get(
+    "ANIME_GIF_URL",
+    "https://media.tenor.com/images/7f3d3c7c7e5f4f7d8e7f7c6c4a0b0d4b/tenor.gif"
+).strip()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=True,       # HTTPS in production
@@ -688,36 +695,30 @@ def api_logout():
 # ADMIN WEB PANEL
 # ============================================================
 
-# Animated background for the web panel.
-# You can replace this from Railway Variables with your own direct GIF URL.
-ANIME_GIF_URL = os.environ.get(
-    "ANIME_GIF_URL",
-    "https://giffiles.alphacoders.com/223/223474.gif"
-).strip()
-
 BASE_STYLE = """
 <style>
 :root{--bg:#070b12;--panel:#101927;--line:#26364d;--text:#eef5ff;--muted:#8fa2bb;--blue:#3b82f6;--green:#34d399;--red:#fb7185}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
-body{margin:0;background:#050810;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative}body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("__ANIME_GIF_URL__");background-size:cover;background-position:center;background-repeat:no-repeat;opacity:.34;filter:saturate(1.15) contrast(1.08);pointer-events:none}body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(135deg,rgba(2,6,15,.76),rgba(4,8,18,.48) 45%,rgba(1,4,12,.82));pointer-events:none}
+html{min-height:100%;background:#050812}
+body{margin:0;background:#050812;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.40;filter:saturate(1.18) contrast(1.08);pointer-events:none}
+body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(180deg,rgba(3,6,15,.48),rgba(3,6,15,.72));pointer-events:none}
+
 a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
 .wrap{max-width:1320px;margin:0 auto;padding:24px 16px 60px;position:relative;z-index:1}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;padding:14px 16px;background:rgba(16,25,39,.9);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;position:sticky;top:12px;z-index:20;box-shadow:0 18px 55px rgba(0,0,0,.3)}
 .brand{display:flex;align-items:center;gap:11px;font-weight:800}.brand-dot{width:11px;height:11px;border-radius:50%;background:var(--green);box-shadow:0 0 18px rgba(52,211,153,.75)}
 .nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#172337;color:#eaf2ff;border:1px solid #2c3e57;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#4d6b94;background:#1c2c44}
 .btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.btn.danger{background:#65152b;border-color:#a83b59}
-.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero img{display:block;width:100%;height:270px;object-fit:cover;opacity:.72}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
+.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
 .card{background:linear-gradient(180deg,rgba(18,29,45,.97),rgba(12,20,32,.97));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
 h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}.stat{font-size:30px;font-weight:850;margin-top:5px}.small{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
 input,select,textarea{width:100%;padding:11px 12px;margin:6px 0 12px;background:#09111d;color:#fff;border:1px solid #30435d;border-radius:10px;outline:none}input:focus,select:focus,textarea:focus{border-color:#5b9cff;box-shadow:0 0 0 3px rgba(59,130,246,.15)}
 table{width:100%;border-collapse:separate;border-spacing:0}th,td{padding:11px;border-bottom:1px solid #243247;text-align:left;vertical-align:middle}th{color:#a9bad0;font-size:12px;text-transform:uppercase;letter-spacing:.05em}tr:hover td{background:rgba(59,130,246,.035)}
 .badge{display:inline-flex;padding:4px 9px;border-radius:999px;background:#1c2a3d;border:1px solid #30435d}.ok{color:var(--green)}.bad{color:var(--red)}.inline{display:inline}code{color:#b9d7ff;background:#09111d;padding:3px 6px;border-radius:6px}.login-shell{min-height:92vh;display:grid;place-items:center}.login-card{width:min(460px,100%);padding:26px}.footer{text-align:center;color:#71839a;font-size:12px;margin-top:20px}
 @media(max-width:800px){.topbar{position:static;align-items:flex-start;flex-direction:column}.nav{justify-content:flex-start}.hero-overlay{padding:20px}table{display:block;overflow-x:auto;white-space:nowrap}}
-.anime-gif{width:100%;max-width:420px;height:220px;object-fit:cover;display:block;margin:0 auto 18px;border-radius:18px;border:1px solid rgba(255,255,255,.12);box-shadow:0 12px 35px rgba(0,0,0,.35)}.key-copy-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.key-copy-row code{font-size:14px}.copy-btn{padding:6px 10px;font-size:12px;min-width:58px}
 </style>
 """
-
-BASE_STYLE = BASE_STYLE.replace("__ANIME_GIF_URL__", ANIME_GIF_URL.replace("\\", "\\\\").replace("\"", "\\\""))
 
 
 def page(title, body):
@@ -755,7 +756,6 @@ def login():
     <div class="wrap login-shell">
       <div class="card login-card">
         <div class="hero" style="margin:-26px -26px 22px;border-radius:17px 17px 0 0;border:0">
-          <img class="anime-gif" src="{{ anime_gif_url }}" alt="Anime GIF">
           <div class="hero-overlay"><div><h1>Private Control Panel</h1><p>Administrator access</p></div></div>
         </div>
         <p class="small">Administrator login</p>
@@ -836,7 +836,6 @@ def dashboard():
 
     body = """
     <div class="hero">
-      <img src="{{ anime_gif_url }}" alt="Anime background">
       <div class="hero-overlay"><div><h1>Private Control Panel</h1><p>Secure key, device and session management</p></div></div>
     </div>
     <div class="grid">
@@ -865,8 +864,7 @@ def dashboard():
         menu_enabled=get_setting("menu_enabled") == "1",
         version=get_setting("menu_version"),
         minver=get_setting("min_client_version"),
-        maintenance=get_setting("maintenance") == "1",
-        anime_gif_url=ANIME_GIF_URL
+        maintenance=get_setting("maintenance") == "1"
     ))
 
 
@@ -928,7 +926,7 @@ def keys_page():
         </tr>
         {% for r in rows %}
         <tr>
-          <td><div class="key-copy-row"><code>{{ r['key'] }}</code><button type="button" class="btn copy-btn" data-key="{{ r['key'] }}" onclick="copyKey(this)">نسخ</button></div><span class="small">{{ r['note'] }}</span></td>
+          <td><code>{{ r['key'] }}</code><br><span class="small">{{ r['note'] }}</span></td>
           <td>{{ status(r) }}</td>
           <td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td>
           <td>
@@ -954,45 +952,29 @@ def keys_page():
     </div>
 
     <script>
-    async function copyText(value, btn){
-        try {
-            if (navigator.clipboard && window.isSecureContext) {
-                await navigator.clipboard.writeText(value);
-            } else {
-                const area = document.createElement("textarea");
-                area.value = value;
-                area.style.position = "fixed";
-                area.style.left = "-9999px";
-                area.style.opacity = "0";
-                document.body.appendChild(area);
-                area.focus();
-                area.select();
-                document.execCommand("copy");
-                area.remove();
-            }
-            if (btn) {
-                const old = btn.textContent;
-                btn.textContent = "تم النسخ ✓";
-                setTimeout(() => btn.textContent = old, 1400);
-            }
-        } catch (e) {
-            if (btn) {
-                const old = btn.textContent;
-                btn.textContent = "فشل النسخ";
-                setTimeout(() => btn.textContent = old, 1400);
-            }
-        }
-    }
-
-    function copyNewKey(){
+    async function copyNewKey(){
         const el = document.getElementById("newKey");
+        if (!el) return;
+        const value = el.textContent.trim();
+        try {
+            await navigator.clipboard.writeText(value);
+        } catch (e) {
+            const area = document.createElement("textarea");
+            area.value = value;
+            area.style.position = "fixed";
+            area.style.opacity = "0";
+            document.body.appendChild(area);
+            area.focus();
+            area.select();
+            document.execCommand("copy");
+            area.remove();
+        }
         const btn = document.querySelector('button[onclick="copyNewKey()"]');
-        if (el) copyText(el.textContent.trim(), btn);
-    }
-
-    function copyKey(btn){
-        if (!btn) return;
-        copyText(btn.dataset.key || "", btn);
+        if (btn) {
+            const old = btn.textContent;
+            btn.textContent = "تم النسخ ✓";
+            setTimeout(() => btn.textContent = old, 1400);
+        }
     }
 
     function countdown(){
@@ -1369,7 +1351,7 @@ def security_headers(response):
         "default-src 'self'; "
         "style-src 'self' 'unsafe-inline'; "
         "script-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:;"
+        "img-src 'self' data: https://media.tenor.com;"
     )
     return response
 
