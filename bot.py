@@ -31,7 +31,6 @@ from werkzeug.security import generate_password_hash, check_password_hash
 #   ADMIN_PASS=your_strong_admin_password
 #   SECRET_KEY=a_long_random_secret
 #   PORT=8080
-
 #
 # Optional:
 #   DB_PATH=modpanel.db
@@ -50,8 +49,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011").strip()
-SECRET_KEY = os.environ.get("SECRET_KEY", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1").strip()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
 
 if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
     raise RuntimeError(
@@ -765,7 +764,7 @@ def api_logout():
 # ============================================================
 
 PLAN_DAYS = {"week": 7, "month": 30, "year": 365, "lifetime": 0}
-PLAN_LABELS = {"week": "Week", "month": "Month", "year": "Year", "lifetime": "Lifetime"}
+PLAN_LABELS = {"week": "أسبوع واحد", "month": "شهر واحد", "year": "سنة واحدة", "lifetime": "اشتراك دائم"}
 
 
 def telegram_api(method, payload=None):
@@ -786,6 +785,14 @@ def bot_send(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return telegram_api("sendMessage", payload)
+
+
+def bot_send_photo(chat_id, photo, caption="", reply_markup=None):
+    """Forward a Telegram photo file_id to the admin with optional review buttons."""
+    payload = {"chat_id": int(chat_id), "photo": photo, "caption": caption[:1024]}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return telegram_api("sendPhoto", payload)
 
 
 def save_telegram_user(user):
@@ -836,7 +843,9 @@ def approve_subscription_request(request_id, reviewer="admin"):
         if not req:
             return False, "Request not found"
         if req["status"] != "pending":
-            return False, "Request is already reviewed"
+            return False, "تمت مراجعة هذا الطلب مسبقاً"
+        if not (req["payment_proof"] or "").startswith("photo_file_id:"):
+            return False, "لا يمكن قبول الطلب قبل استلام صورة حساب اللعبة"
         days = PLAN_DAYS.get(req["plan"])
         if days is None:
             return False, "Invalid plan"
@@ -889,7 +898,7 @@ def bot_handle_update(update):
         if data.startswith("plan:"):
             plan = data.split(":", 1)[1]
             if plan not in PLAN_DAYS:
-                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Invalid plan"})
+                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "خطة غير صحيحة"})
                 return
             with db() as c:
                 cur = c.execute("""
@@ -897,38 +906,48 @@ def bot_handle_update(update):
                     VALUES(?,?,'pending',?)
                 """, (int(user["id"]), plan, iso(now_utc())))
                 request_id = cur.lastrowid
-            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Request created"})
-            instructions = get_setting("payment_instructions", "Please send your payment proof or transaction reference in this chat.")
-            bot_send(user["id"], f"Your {PLAN_LABELS[plan]} subscription request #{request_id} has been created.\n\n{instructions}\n\nAfter sending proof, wait for admin approval.")
+            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تم إنشاء الطلب"})
+            instructions = get_setting("payment_instructions", "").strip()
+            extra = f"\n\nملاحظة: {instructions}" if instructions else ""
+            bot_send(user["id"],
+                f"تم إنشاء طلب الاشتراك رقم #{request_id} ({PLAN_LABELS[plan]}).\n\n"
+                "الخطوة التالية: أرسل صورة واضحة من داخل لعبة Bounty Rush يظهر فيها حسابك أو معلومات اللاعب. "
+                "يمكنك إضافة رقم اللاعب أو اسمه في وصف الصورة.\n\n"
+                "لا ترسل كلمة مرور أو رمز تسجيل دخول." + extra)
             if TELEGRAM_ADMIN_ID:
-                proof_text = f"New subscription request #{request_id}\nUser: {user.get('first_name','')} (@{user.get('username','')})\nTelegram ID: {user['id']}\nPlan: {PLAN_LABELS[plan]}\nWaiting for payment proof; approval buttons will be sent after proof arrives."
-                bot_send(TELEGRAM_ADMIN_ID, proof_text)
+                bot_send(TELEGRAM_ADMIN_ID,
+                    f"طلب اشتراك جديد #{request_id}\n"
+                    f"المستخدم: {user.get('first_name','')} (@{user.get('username','')})\n"
+                    f"معرّف تيليجرام: {user['id']}\n"
+                    f"الخطة: {PLAN_LABELS[plan]}\nبانتظار صورة الحساب.")
             return
         if data.startswith("req:"):
             if not TELEGRAM_ADMIN_ID or str(user.get("id")) != TELEGRAM_ADMIN_ID:
-                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Not authorized", "show_alert": True})
+                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "غير مصرح لك", "show_alert": True})
                 return
-            _, action, raw_id = data.split(":", 2)
             try:
+                _, action, raw_id = data.split(":", 2)
                 request_id = int(raw_id)
-            except ValueError:
+            except (ValueError, TypeError):
                 return
             if action == "approve":
                 ok, result = approve_subscription_request(request_id, str(user.get("id")))
                 if ok:
-                    expiry = result["expires_at"] or "Never"
-                    bot_send(result["telegram_id"], f"Your subscription is approved!\nPlan activated. Expiration: {expiry}\n\nOpen the app, generate a temporary link code, then send that code here to connect your account.")
-                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Approved"})
-                    bot_send(user["id"], f"Request #{request_id} approved. Device limit: {result['device_limit']}.")
+                    expiry = result["expires_at"] or "دائم"
+                    bot_send(result["telegram_id"],
+                        f"تمت الموافقة على اشتراكك!\nانتهى الاشتراك: {expiry}\n\n"
+                        "افتح التطبيق وأنشئ رمز ربط مؤقت، ثم أرسل الرمز هنا لربط حسابك.")
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تمت الموافقة"})
+                    bot_send(user["id"], f"تم قبول الطلب رقم #{request_id}. عدد الأجهزة المسموح: {result['device_limit']}.")
                 else:
                     telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": str(result), "show_alert": True})
             elif action == "reject":
                 ok, target = reject_subscription_request(request_id, str(user.get("id")))
                 if ok and target:
-                    bot_send(target, f"Your subscription request #{request_id} was not approved. Contact the administrator if you think this is a mistake.")
-                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Rejected"})
+                    bot_send(target, f"لم تتم الموافقة على طلب الاشتراك رقم #{request_id}. يمكنك التواصل مع الإدارة للاستفسار.")
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تم رفض الطلب"})
                 else:
-                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Request already reviewed", "show_alert": True})
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تمت مراجعة الطلب مسبقاً", "show_alert": True})
             return
     if not message:
         return
@@ -939,18 +958,32 @@ def bot_handle_update(update):
     save_telegram_user(user)
     refresh_telegram_photo(user.get("id"))
     text_value = (message.get("text") or "").strip()
+
+    # Owner-only instructions.
+    if text_value.split(" ", 1)[0].split("@", 1)[0] == "/adminhelp":
+        if not TELEGRAM_ADMIN_ID or str(user.get("id")) != TELEGRAM_ADMIN_ID:
+            bot_send(chat_id, "هذا الأمر مخصص للإدارة فقط.")
+            return
+        bot_send(chat_id,
+            "تعليمات مراجعة طلبات الاشتراك:\n\n"
+            "1) اختر الطلب من رسالة البوت التي تصلك عند إنشاء اشتراك جديد.\n"
+            "2) انتظر وصول صورة حساب Bounty Rush؛ ستصلك الصورة نفسها مع رقم الطلب وبيانات صاحبه.\n"
+            "3) افحص أن الصورة واضحة وتُظهر معلومات الحساب المطلوبة.\n"
+            "4) اضغط (موافقة) لتفعيل الاشتراك تلقائياً، أو (رفض) إذا كانت الصورة غير واضحة أو لا تخص الحساب.\n"
+            "5) يمكن أيضاً مراجعة الطلبات من لوحة التحكم ثم صفحة اشتراكات تيليجرام.\n\n"
+            "مهم: لا تطلب كلمة مرور اللعبة أو رموز تسجيل الدخول من أي شخص. راجع الصور ومعلومات الحساب الظاهرة فقط.")
+        return
+
     if text_value.startswith("/start"):
         markup = {"inline_keyboard": [
-            [{"text": "1 Week", "callback_data": "plan:week"}, {"text": "1 Month", "callback_data": "plan:month"}],
-            [{"text": "1 Year", "callback_data": "plan:year"}, {"text": "Lifetime", "callback_data": "plan:lifetime"}]
+            [{"text": "أسبوع واحد", "callback_data": "plan:week"}, {"text": "شهر واحد", "callback_data": "plan:month"}],
+            [{"text": "سنة واحدة", "callback_data": "plan:year"}, {"text": "اشتراك دائم", "callback_data": "plan:lifetime"}]
         ]}
-        bot_send(chat_id, "Welcome! Choose your subscription plan:", markup)
+        bot_send(chat_id, "أهلاً بك! اختر مدة الاشتراك:", markup)
         return
-    # A payment proof can be text, a transaction reference, or a Telegram photo.
-    proof = text_value
+
+    # A photo from the game account is the only accepted subscription proof.
     if message.get("photo"):
-        proof = "photo_file_id:" + message["photo"][-1].get("file_id", "")
-    if proof:
         with db() as c:
             req = c.execute("""
                 SELECT * FROM subscription_requests
@@ -958,17 +991,49 @@ def bot_handle_update(update):
                 ORDER BY id DESC LIMIT 1
             """, (int(user["id"]),)).fetchone()
             if req:
-                c.execute("UPDATE subscription_requests SET payment_proof=? WHERE id=?", (proof[:1500], req["id"]))
-        if req:
-            bot_send(chat_id, "Payment proof received. Please wait for manual admin review.")
-            if TELEGRAM_ADMIN_ID:
-                preview = proof[:500] if not proof.startswith("photo_file_id:") else "Photo proof attached in the user's chat."
-                markup = {"inline_keyboard": [[
-                    {"text": "Approve", "callback_data": f"req:approve:{req['id']}"},
-                    {"text": "Reject", "callback_data": f"req:reject:{req['id']}"}
-                ]]}
-                bot_send(TELEGRAM_ADMIN_ID, f"Payment proof for request #{req['id']}\nTelegram ID: {user['id']}\nPlan: {PLAN_LABELS.get(req['plan'], req['plan'])}\nProof: {preview}", markup)
+                file_id = message["photo"][-1].get("file_id", "")
+                caption_text = (message.get("caption") or "").strip()
+                proof_value = "photo_file_id:" + file_id + "\ncaption:" + caption_text
+                c.execute("UPDATE subscription_requests SET payment_proof=? WHERE id=?", (proof_value[:1500], req["id"]))
+        if not req:
+            bot_send(chat_id, "لم أجد طلب اشتراك معلّقاً. أرسل /start واختر مدة الاشتراك أولاً.")
             return
+        if not file_id:
+            bot_send(chat_id, "لم أتمكن من قراءة الصورة. أعد إرسال لقطة الشاشة من فضلك.")
+            return
+        if TELEGRAM_ADMIN_ID:
+            caption = (
+                f"صورة حساب لطلب الاشتراك #{req['id']}\n"
+                f"المستخدم: {user.get('first_name','')} (@{user.get('username','')})\n"
+                f"معرّف تيليجرام: {user['id']}\n"
+                f"الخطة: {PLAN_LABELS.get(req['plan'], req['plan'])}\n"
+                f"معلومات إضافية: {caption_text or 'لا يوجد'}"
+            )
+            markup = {"inline_keyboard": [[
+                {"text": "موافقة", "callback_data": f"req:approve:{req['id']}"},
+                {"text": "رفض", "callback_data": f"req:reject:{req['id']}"}
+            ]]}
+            try:
+                bot_send_photo(TELEGRAM_ADMIN_ID, file_id, caption, markup)
+            except Exception as exc:
+                audit("TELEGRAM_PROOF_FORWARD_ERROR", str(exc)[:500])
+                bot_send(chat_id, "تم استلام الصورة، لكن تعذر إرسالها للإدارة حالياً. حاول مرة أخرى بعد قليل.")
+                return
+        bot_send(chat_id, "وصلت صورة الحساب وتم إرسالها إلى الإدارة للمراجعة. انتظر الرد هنا.")
+        return
+
+    # Text is not accepted as proof; users must send an in-game screenshot.
+    if text_value:
+        with db() as c:
+            pending = c.execute("""
+                SELECT id FROM subscription_requests
+                WHERE telegram_id=? AND status='pending'
+                ORDER BY id DESC LIMIT 1
+            """, (int(user["id"]),)).fetchone()
+        if pending and not text_value.startswith("/"):
+            bot_send(chat_id, "لا نعتمد النصوص أو أرقام التحويل كإثبات. أرسل صورة واضحة لحسابك من داخل لعبة Bounty Rush، ويمكنك كتابة رقم اللاعب في وصف الصورة.")
+            return
+
     # Link codes are short, one-time codes generated by the app.
     if text_value and len(text_value) <= 32 and text_value.replace("-", "").isalnum():
         digest = hash_token(text_value.upper())
@@ -982,9 +1047,9 @@ def bot_handle_update(update):
             else:
                 linked = False
         if linked:
-            bot_send(chat_id, "Account linked successfully! Return to the app; it will finish signing you in.")
+            bot_send(chat_id, "تم ربط الحساب بنجاح! ارجع إلى التطبيق لإكمال تسجيل الدخول.")
         else:
-            bot_send(chat_id, "Code not accepted. Check that your subscription is approved and the code is still valid.")
+            bot_send(chat_id, "الرمز غير صالح. تأكد من تفعيل اشتراكك وأن الرمز ما زال صالحاً.")
 
 
 def telegram_poll_loop():
@@ -1645,32 +1710,32 @@ def telegram_subscriptions_page():
             JOIN keys k ON k.id=s.key_id ORDER BY s.id DESC LIMIT 200
         """).fetchall()
     body = """
-    <h1>Telegram Subscriptions</h1>
+    <h1>اشتراكات تيليجرام</h1>
     <div class="card">
-      <h2>Bot setup</h2>
-      <p class="small">Set TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID and TELEGRAM_POLLING=1 in your hosting environment. Never put the bot token in this page or inside the Android app.</p>
-      <p>Bot status: <b class="{{ 'ok' if bot_ready else 'bad' }}">{{ 'Configured' if bot_ready else 'Missing environment variables' }}</b></p>
+      <h2>إعداد البوت</h2>
+      <p class="small">ضع TELEGRAM_BOT_TOKEN و TELEGRAM_ADMIN_ID و TELEGRAM_POLLING=1 في متغيرات الاستضافة. لا تضع رمز البوت هنا أو داخل تطبيق أندرويد.</p>
+      <p>Bot status: <b class="{{ 'ok' if bot_ready else 'bad' }}">{{ 'جاهز' if bot_ready else 'متغيرات الإعداد ناقصة' }}</b></p>
       <form method="post" action="{{ url_for('telegram_settings_save') }}">
         <input type="hidden" name="csrf" value="{{ csrf }}">
-        <label>Payment instructions shown by the bot</label>
+        <label>ملاحظة إضافية تظهر للمستخدم (اختياري)</label>
         <textarea name="payment_instructions" rows="3">{{ payment_instructions }}</textarea>
-        <label>Default device limit for new Telegram subscriptions</label>
+        <label>عدد الأجهزة الافتراضي للاشتراكات الجديدة</label>
         <input type="number" name="device_limit" min="1" max="100" value="{{ device_limit }}">
-        <button class="btn primary">Save Telegram Settings</button>
+        <button class="btn primary">حفظ إعدادات تيليجرام</button>
       </form>
     </div>
-    <div class="card"><h2>Subscription Requests</h2><table>
-      <tr><th>ID</th><th>User</th><th>Plan</th><th>Status</th><th>Payment proof</th><th>Created</th><th>Actions</th></tr>
+    <div class="card"><h2>طلبات الاشتراك</h2><table>
+      <tr><th>الطلب</th><th>المستخدم</th><th>الخطة</th><th>الحالة</th><th>الإثبات</th><th>التاريخ</th><th>الإجراء</th></tr>
       {% for r in requests_rows %}<tr>
         <td>#{{ r['id'] }}</td><td>{{ r['first_name'] or '' }} @{{ r['username'] or 'no_username' }}<br><span class="small">{{ r['telegram_id'] }}</span></td>
-        <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td>{{ r['status'] }}</td><td>{{ r['payment_proof'] or '-' }}</td><td>{{ r['created_at'] }}</td><td>
+        <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td>{{ {'pending':'قيد المراجعة','approved':'مقبول','rejected':'مرفوض'}.get(r['status'],r['status']) }}</td><td>{{ 'تم استلام صورة' if (r['payment_proof'] or '').startswith('photo_file_id:') else 'بانتظار الصورة' }}</td><td>{{ r['created_at'] }}</td><td>
         {% if r['status']=='pending' %}
-          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='approve') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">Approve</button></form>
-          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='reject') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn danger">Reject</button></form>
+          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='approve') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">موافقة</button></form>
+          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='reject') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn danger">رفض</button></form>
         {% else %}-{% endif %}</td></tr>{% endfor %}
     </table></div>
-    <div class="card"><h2>Subscribers</h2><table>
-      <tr><th>User</th><th>Plan</th><th>Key</th><th>Devices</th><th>Expires</th><th>Status</th></tr>
+    <div class="card"><h2>المشتركون</h2><table>
+      <tr><th>المستخدم</th><th>الخطة</th><th>المفتاح</th><th>الأجهزة</th><th>الانتهاء</th><th>الحالة</th></tr>
       {% for r in subs_rows %}<tr><td>{{ r['first_name'] or '' }} @{{ r['username'] or 'no_username' }}<br><span class="small">{{ r['telegram_id'] }}</span></td>
       <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td><code>{{ r['key'] }}</code></td><td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td><td>{{ r['expires_at'] or 'Lifetime' }}</td><td>{{ 'Active' if r['active'] else 'Disabled' }}</td></tr>{% endfor %}
     </table></div>
@@ -1678,7 +1743,7 @@ def telegram_subscriptions_page():
     return page("Telegram Subscriptions", render_template_string(body, requests_rows=requests_rows,
         subs_rows=subs_rows, plan_labels=PLAN_LABELS, csrf=csrf_token(),
         bot_ready=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID),
-        payment_instructions=get_setting("payment_instructions", "Please send your payment proof or transaction reference in this chat."),
+        payment_instructions=get_setting("payment_instructions", ""),
         device_limit=get_setting("telegram_device_limit", "1")))
 
 
@@ -1704,14 +1769,14 @@ def telegram_request_action(request_id, action):
         ok, result = approve_subscription_request(request_id, "web-panel")
         if ok and TELEGRAM_BOT_TOKEN:
             try:
-                bot_send(result["telegram_id"], "Your subscription is approved! Open the app, generate a temporary link code, then send it here to connect your account.")
+                bot_send(result["telegram_id"], "تمت الموافقة على اشتراكك! افتح التطبيق وأنشئ رمز ربط مؤقت، ثم أرسل الرمز هنا لربط حسابك.")
             except Exception as exc:
                 audit("TELEGRAM_NOTIFY_ERROR", str(exc)[:500])
     elif action == "reject":
         ok, target = reject_subscription_request(request_id, "web-panel")
         if ok and target and TELEGRAM_BOT_TOKEN:
             try:
-                bot_send(target, f"Your subscription request #{request_id} was rejected.")
+                bot_send(target, f"لم تتم الموافقة على طلب الاشتراك رقم #{request_id}.")
             except Exception as exc:
                 audit("TELEGRAM_NOTIFY_ERROR", str(exc)[:500])
     else:
