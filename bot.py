@@ -1,5 +1,4 @@
 
-
 import os
 import json
 import sqlite3
@@ -82,7 +81,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8959881524:AAHJKmUz59
 TELEGRAM_ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "8299101176").strip()
 TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "MoldesKeysBot").strip().lstrip("@")
 TELEGRAM_BOT_NAME = os.environ.get("TELEGRAM_BOT_NAME", "Key EX25").strip()
-TELEGRAM_POLLING = os.environ.get("TELEGRAM_POLLING", "1") == "1"
+TELEGRAM_POLLING = os.environ.get("TELEGRAM_POLLING", "0") == "1"
 BOT_POLL_OFFSET = 0
 BOT_THREAD_STARTED = False
 BOT_THREAD_LOCK = threading.Lock()
@@ -765,7 +764,7 @@ def api_logout():
 # ============================================================
 
 PLAN_DAYS = {"week": 7, "month": 30, "year": 365, "lifetime": 0}
-PLAN_LABELS = {"week": "أسبوع واحد", "month": "شهر واحد", "year": "سنة واحدة", "lifetime": "اشتراك دائم"}
+PLAN_LABELS = {"week": "Week", "month": "Month", "year": "Year", "lifetime": "Lifetime"}
 
 
 def telegram_api(method, payload=None):
@@ -788,14 +787,6 @@ def bot_send(chat_id, text, reply_markup=None):
     return telegram_api("sendMessage", payload)
 
 
-def bot_send_photo(chat_id, photo, caption="", reply_markup=None):
-    """Forward a Telegram photo file_id to the admin with optional review buttons."""
-    payload = {"chat_id": int(chat_id), "photo": photo, "caption": caption[:1024]}
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return telegram_api("sendPhoto", payload)
-
-
 def save_telegram_user(user):
     tid = int(user.get("id"))
     with db() as c:
@@ -810,66 +801,17 @@ def save_telegram_user(user):
 
 
 def refresh_telegram_photo(telegram_id):
-    """Store and return the largest available Telegram profile-photo file_id."""
+    """Store the largest available profile-photo file_id; the bot token stays server-side."""
     if not TELEGRAM_BOT_TOKEN:
-        return ""
+        return
     try:
-        result = telegram_api(
-            "getUserProfilePhotos",
-            {"user_id": int(telegram_id), "offset": 0, "limit": 1}
-        )
+        result = telegram_api("getUserProfilePhotos", {"user_id": int(telegram_id), "offset": 0, "limit": 1})
         photos = result.get("photos") or []
         file_id = photos[0][-1].get("file_id", "") if photos and photos[0] else ""
         with db() as c:
-            c.execute(
-                "UPDATE telegram_users SET photo_file_id=? WHERE telegram_id=?",
-                (file_id, int(telegram_id))
-            )
-        return file_id
+            c.execute("UPDATE telegram_users SET photo_file_id=? WHERE telegram_id=?", (file_id, int(telegram_id)))
     except Exception as exc:
         audit("TELEGRAM_PHOTO_ERROR", str(exc)[:300])
-        return ""
-
-
-def notify_admin_new_subscription_request(request_id, user, plan):
-    """Send the applicant's Telegram profile photo and request details to the admin."""
-    if not TELEGRAM_ADMIN_ID:
-        return
-
-    username = user.get("username") or "بدون اسم مستخدم"
-    full_name = " ".join(
-        part for part in (user.get("first_name", ""), user.get("last_name", "")) if part
-    ) or "غير متوفر"
-    caption = (
-        f"طلب اشتراك جديد #{request_id}\n"
-        f"الاسم: {full_name}\n"
-        f"المستخدم: @{username}\n"
-        f"معرّف تيليجرام: {user.get('id')}\n"
-        f"الخطة: {PLAN_LABELS.get(plan, plan)}\n"
-        "هذه صورة الملف الشخصي في تيليجرام. بانتظار صورة حساب اللعبة."
-    )
-
-    with db() as c:
-        row = c.execute(
-            "SELECT photo_file_id FROM telegram_users WHERE telegram_id=?",
-            (int(user["id"]),)
-        ).fetchone()
-    profile_photo = row["photo_file_id"] if row else ""
-
-    try:
-        if profile_photo:
-            bot_send_photo(TELEGRAM_ADMIN_ID, profile_photo, caption)
-        else:
-            bot_send(
-                TELEGRAM_ADMIN_ID,
-                caption + "\n\nلم يضع المستخدم صورة شخصية في تيليجرام أو تعذر جلبها."
-            )
-    except Exception as exc:
-        audit("TELEGRAM_PROFILE_FORWARD_ERROR", str(exc)[:500])
-        try:
-            bot_send(TELEGRAM_ADMIN_ID, caption + "\n\nتعذر إرسال الصورة الشخصية.")
-        except Exception as notify_exc:
-            audit("TELEGRAM_ADMIN_NOTIFY_ERROR", str(notify_exc)[:500])
 
 
 def active_subscription(telegram_id):
@@ -893,9 +835,7 @@ def approve_subscription_request(request_id, reviewer="admin"):
         if not req:
             return False, "Request not found"
         if req["status"] != "pending":
-            return False, "تمت مراجعة هذا الطلب مسبقاً"
-        if not (req["payment_proof"] or "").startswith("photo_file_id:"):
-            return False, "لا يمكن قبول الطلب قبل استلام صورة حساب اللعبة"
+            return False, "Request is already reviewed"
         days = PLAN_DAYS.get(req["plan"])
         if days is None:
             return False, "Invalid plan"
@@ -948,7 +888,7 @@ def bot_handle_update(update):
         if data.startswith("plan:"):
             plan = data.split(":", 1)[1]
             if plan not in PLAN_DAYS:
-                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "خطة غير صحيحة"})
+                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Invalid plan"})
                 return
             with db() as c:
                 cur = c.execute("""
@@ -956,43 +896,38 @@ def bot_handle_update(update):
                     VALUES(?,?,'pending',?)
                 """, (int(user["id"]), plan, iso(now_utc())))
                 request_id = cur.lastrowid
-            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تم إنشاء الطلب"})
-            instructions = get_setting("payment_instructions", "").strip()
-            extra = f"\n\nملاحظة: {instructions}" if instructions else ""
-            bot_send(user["id"],
-                f"تم إنشاء طلب الاشتراك رقم #{request_id} ({PLAN_LABELS[plan]}).\n\n"
-                "الخطوة التالية: أرسل صورة واضحة من داخل لعبة Bounty Rush يظهر فيها حسابك أو معلومات اللاعب. "
-                "يمكنك إضافة رقم اللاعب أو اسمه في وصف الصورة.\n\n"
-                "لا ترسل كلمة مرور أو رمز تسجيل دخول." + extra)
-            notify_admin_new_subscription_request(request_id, user, plan)
+            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Request created"})
+            instructions = get_setting("payment_instructions", "Please send your payment proof or transaction reference in this chat.")
+            bot_send(user["id"], f"Your {PLAN_LABELS[plan]} subscription request #{request_id} has been created.\n\n{instructions}\n\nAfter sending proof, wait for admin approval.")
+            if TELEGRAM_ADMIN_ID:
+                proof_text = f"New subscription request #{request_id}\nUser: {user.get('first_name','')} (@{user.get('username','')})\nTelegram ID: {user['id']}\nPlan: {PLAN_LABELS[plan]}\nWaiting for payment proof; approval buttons will be sent after proof arrives."
+                bot_send(TELEGRAM_ADMIN_ID, proof_text)
             return
         if data.startswith("req:"):
             if not TELEGRAM_ADMIN_ID or str(user.get("id")) != TELEGRAM_ADMIN_ID:
-                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "غير مصرح لك", "show_alert": True})
+                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Not authorized", "show_alert": True})
                 return
+            _, action, raw_id = data.split(":", 2)
             try:
-                _, action, raw_id = data.split(":", 2)
                 request_id = int(raw_id)
-            except (ValueError, TypeError):
+            except ValueError:
                 return
             if action == "approve":
                 ok, result = approve_subscription_request(request_id, str(user.get("id")))
                 if ok:
-                    expiry = result["expires_at"] or "دائم"
-                    bot_send(result["telegram_id"],
-                        f"تمت الموافقة على اشتراكك!\nانتهى الاشتراك: {expiry}\n\n"
-                        "افتح التطبيق وأنشئ رمز ربط مؤقت، ثم أرسل الرمز هنا لربط حسابك.")
-                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تمت الموافقة"})
-                    bot_send(user["id"], f"تم قبول الطلب رقم #{request_id}. عدد الأجهزة المسموح: {result['device_limit']}.")
+                    expiry = result["expires_at"] or "Never"
+                    bot_send(result["telegram_id"], f"Your subscription is approved!\nPlan activated. Expiration: {expiry}\n\nOpen the app, generate a temporary link code, then send that code here to connect your account.")
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Approved"})
+                    bot_send(user["id"], f"Request #{request_id} approved. Device limit: {result['device_limit']}.")
                 else:
                     telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": str(result), "show_alert": True})
             elif action == "reject":
                 ok, target = reject_subscription_request(request_id, str(user.get("id")))
                 if ok and target:
-                    bot_send(target, f"لم تتم الموافقة على طلب الاشتراك رقم #{request_id}. يمكنك التواصل مع الإدارة للاستفسار.")
-                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تم رفض الطلب"})
+                    bot_send(target, f"Your subscription request #{request_id} was not approved. Contact the administrator if you think this is a mistake.")
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Rejected"})
                 else:
-                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تمت مراجعة الطلب مسبقاً", "show_alert": True})
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Request already reviewed", "show_alert": True})
             return
     if not message:
         return
@@ -1003,39 +938,18 @@ def bot_handle_update(update):
     save_telegram_user(user)
     refresh_telegram_photo(user.get("id"))
     text_value = (message.get("text") or "").strip()
-
-    # Owner-only instructions.
-    if text_value.split(" ", 1)[0].split("@", 1)[0] == "/adminhelp":
-        if not TELEGRAM_ADMIN_ID or str(user.get("id")) != TELEGRAM_ADMIN_ID:
-            bot_send(chat_id, "هذا الأمر مخصص للإدارة فقط.")
-            return
-        bot_send(chat_id,
-            "تعليمات مراجعة طلبات الاشتراك:\n\n"
-            "1) اختر الطلب من رسالة البوت التي تصلك عند إنشاء اشتراك جديد.\n"
-            "2) انتظر وصول صورة حساب Bounty Rush؛ ستصلك الصورة نفسها مع رقم الطلب وبيانات صاحبه.\n"
-            "3) افحص أن الصورة واضحة وتُظهر معلومات الحساب المطلوبة.\n"
-            "4) اضغط (موافقة) لتفعيل الاشتراك تلقائياً، أو (رفض) إذا كانت الصورة غير واضحة أو لا تخص الحساب.\n"
-            "5) يمكن أيضاً مراجعة الطلبات من لوحة التحكم ثم صفحة اشتراكات تيليجرام.\n\n"
-            "مهم: لا تطلب كلمة مرور اللعبة أو رموز تسجيل الدخول من أي شخص. راجع الصور ومعلومات الحساب الظاهرة فقط.")
-        return
-
     if text_value.startswith("/start"):
         markup = {"inline_keyboard": [
-            [{"text": "أسبوع واحد", "callback_data": "plan:week"}, {"text": "شهر واحد", "callback_data": "plan:month"}],
-            [{"text": "سنة واحدة", "callback_data": "plan:year"}, {"text": "اشتراك دائم", "callback_data": "plan:lifetime"}]
+            [{"text": "1 Week", "callback_data": "plan:week"}, {"text": "1 Month", "callback_data": "plan:month"}],
+            [{"text": "1 Year", "callback_data": "plan:year"}, {"text": "Lifetime", "callback_data": "plan:lifetime"}]
         ]}
-        bot_send(
-            chat_id,
-            "أهلاً بك! اختر مدة الاشتراك:\n\n"
-            "عند تقديم الطلب، سيتم إرسال صورة ملفك الشخصي المتاحة في تيليجرام إلى الإدارة للمراجعة، "
-            "وبعدها سيُطلب منك إرسال صورة حسابك من داخل لعبة Bounty Rush.\n"
-            "لا ترسل كلمة مرور أو رمز تسجيل الدخول.",
-            markup
-        )
+        bot_send(chat_id, "Welcome! Choose your subscription plan:", markup)
         return
-
-    # A photo from the game account is the only accepted subscription proof.
+    # A payment proof can be text, a transaction reference, or a Telegram photo.
+    proof = text_value
     if message.get("photo"):
+        proof = "photo_file_id:" + message["photo"][-1].get("file_id", "")
+    if proof:
         with db() as c:
             req = c.execute("""
                 SELECT * FROM subscription_requests
@@ -1043,49 +957,17 @@ def bot_handle_update(update):
                 ORDER BY id DESC LIMIT 1
             """, (int(user["id"]),)).fetchone()
             if req:
-                file_id = message["photo"][-1].get("file_id", "")
-                caption_text = (message.get("caption") or "").strip()
-                proof_value = "photo_file_id:" + file_id + "\ncaption:" + caption_text
-                c.execute("UPDATE subscription_requests SET payment_proof=? WHERE id=?", (proof_value[:1500], req["id"]))
-        if not req:
-            bot_send(chat_id, "لم أجد طلب اشتراك معلّقاً. أرسل /start واختر مدة الاشتراك أولاً.")
+                c.execute("UPDATE subscription_requests SET payment_proof=? WHERE id=?", (proof[:1500], req["id"]))
+        if req:
+            bot_send(chat_id, "Payment proof received. Please wait for manual admin review.")
+            if TELEGRAM_ADMIN_ID:
+                preview = proof[:500] if not proof.startswith("photo_file_id:") else "Photo proof attached in the user's chat."
+                markup = {"inline_keyboard": [[
+                    {"text": "Approve", "callback_data": f"req:approve:{req['id']}"},
+                    {"text": "Reject", "callback_data": f"req:reject:{req['id']}"}
+                ]]}
+                bot_send(TELEGRAM_ADMIN_ID, f"Payment proof for request #{req['id']}\nTelegram ID: {user['id']}\nPlan: {PLAN_LABELS.get(req['plan'], req['plan'])}\nProof: {preview}", markup)
             return
-        if not file_id:
-            bot_send(chat_id, "لم أتمكن من قراءة الصورة. أعد إرسال لقطة الشاشة من فضلك.")
-            return
-        if TELEGRAM_ADMIN_ID:
-            caption = (
-                f"صورة حساب لطلب الاشتراك #{req['id']}\n"
-                f"المستخدم: {user.get('first_name','')} (@{user.get('username','')})\n"
-                f"معرّف تيليجرام: {user['id']}\n"
-                f"الخطة: {PLAN_LABELS.get(req['plan'], req['plan'])}\n"
-                f"معلومات إضافية: {caption_text or 'لا يوجد'}"
-            )
-            markup = {"inline_keyboard": [[
-                {"text": "موافقة", "callback_data": f"req:approve:{req['id']}"},
-                {"text": "رفض", "callback_data": f"req:reject:{req['id']}"}
-            ]]}
-            try:
-                bot_send_photo(TELEGRAM_ADMIN_ID, file_id, caption, markup)
-            except Exception as exc:
-                audit("TELEGRAM_PROOF_FORWARD_ERROR", str(exc)[:500])
-                bot_send(chat_id, "تم استلام الصورة، لكن تعذر إرسالها للإدارة حالياً. حاول مرة أخرى بعد قليل.")
-                return
-        bot_send(chat_id, "وصلت صورة الحساب وتم إرسالها إلى الإدارة للمراجعة. انتظر الرد هنا.")
-        return
-
-    # Text is not accepted as proof; users must send an in-game screenshot.
-    if text_value:
-        with db() as c:
-            pending = c.execute("""
-                SELECT id FROM subscription_requests
-                WHERE telegram_id=? AND status='pending'
-                ORDER BY id DESC LIMIT 1
-            """, (int(user["id"]),)).fetchone()
-        if pending and not text_value.startswith("/"):
-            bot_send(chat_id, "لا نعتمد النصوص أو أرقام التحويل كإثبات. أرسل صورة واضحة لحسابك من داخل لعبة Bounty Rush، ويمكنك كتابة رقم اللاعب في وصف الصورة.")
-            return
-
     # Link codes are short, one-time codes generated by the app.
     if text_value and len(text_value) <= 32 and text_value.replace("-", "").isalnum():
         digest = hash_token(text_value.upper())
@@ -1099,9 +981,9 @@ def bot_handle_update(update):
             else:
                 linked = False
         if linked:
-            bot_send(chat_id, "تم ربط الحساب بنجاح! ارجع إلى التطبيق لإكمال تسجيل الدخول.")
+            bot_send(chat_id, "Account linked successfully! Return to the app; it will finish signing you in.")
         else:
-            bot_send(chat_id, "الرمز غير صالح. تأكد من تفعيل اشتراكك وأن الرمز ما زال صالحاً.")
+            bot_send(chat_id, "Code not accepted. Check that your subscription is approved and the code is still valid.")
 
 
 def telegram_poll_loop():
@@ -1258,4 +1140,86 @@ a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
 .brand{display:flex;align-items:center;gap:11px;font-weight:800}.brand-dot{width:11px;height:11px;border-radius:50%;background:var(--green);box-shadow:0 0 18px rgba(52,211,153,.75)}
 .nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#172337;color:#eaf2ff;border:1px solid #2c3e57;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#4d6b94;background:#1c2c44}
 .btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.btn.danger{background:#65152b;border-color:#a83b59}
-.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7
+.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
+.card{background:linear-gradient(180deg,rgba(18,29,45,.97),rgba(12,20,32,.97));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
+h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}.stat{font-size:30px;font-weight:850;margin-top:5px}.small{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
+input,select,textarea{width:100%;padding:11px 12px;margin:6px 0 12px;background:#09111d;color:#fff;border:1px solid #30435d;border-radius:10px;outline:none}input:focus,select:focus,textarea:focus{border-color:#5b9cff;box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+table{width:100%;border-collapse:separate;border-spacing:0}th,td{padding:11px;border-bottom:1px solid #243247;text-align:left;vertical-align:middle}th{color:#a9bad0;font-size:12px;text-transform:uppercase;letter-spacing:.05em}tr:hover td{background:rgba(59,130,246,.035)}
+.badge{display:inline-flex;padding:4px 9px;border-radius:999px;background:#1c2a3d;border:1px solid #30435d}.ok{color:var(--green)}.bad{color:var(--red)}.inline{display:inline}code{color:#b9d7ff;background:#09111d;padding:3px 6px;border-radius:6px}.login-shell{min-height:92vh;display:grid;place-items:center}.login-card{width:min(460px,100%);padding:26px}.footer{text-align:center;color:#71839a;font-size:12px;margin-top:20px}
+@media(max-width:800px){.topbar{position:static;align-items:flex-start;flex-direction:column}.nav{justify-content:flex-start}.hero-overlay{padding:20px}table{display:block;overflow-x:auto;white-space:nowrap}}
+</style>
+"""
+
+
+def page(title, body):
+    return render_template_string(
+        BASE_STYLE + """
+        <div class="wrap">
+          <header class="topbar">
+            <div class="brand"><span class="brand-dot"></span>Private Control Panel</div>
+            <nav class="nav">
+              <a href="{{ url_for('dashboard') }}">Dashboard</a>
+              <a href="{{ url_for('keys_page') }}">Keys</a>
+              <a href="{{ url_for('devices_page') }}">Devices</a>
+              <a href="{{ url_for('features_page') }}">Permissions</a>
+              <a href="{{ url_for('telegram_subscriptions_page') }}">Telegram Subscriptions</a>
+              <a href="{{ url_for('settings_page') }}">Settings</a>
+              <a href="{{ url_for('logs_page') }}">Logs</a>
+            <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
+              <a href="{{ url_for('logout') }}">Logout</a>
+            </nav>
+          </header>
+          """ + body + """
+          <div class="footer">Secure admin panel • Server time: UTC</div>
+        </div>
+        """,
+        title=title,
+        csrf=csrf_token(),
+        anime_gif_url=ANIME_GIF_URL
+    )
+
+@app.get("/login")
+def login():
+    if session.get("admin"):
+        return redirect(url_for("dashboard"))
+
+    return render_template_string(BASE_STYLE + """
+    <div class="wrap login-shell">
+      <div class="card login-card">
+        <div class="hero" style="margin:-26px -26px 22px;border-radius:17px 17px 0 0;border:0">
+          <div class="hero-overlay"><div><h1>Private Control Panel</h1><p>Administrator access</p></div></div>
+        </div>
+        <p class="small">Administrator login</p>
+        {% if error %}<p class="bad">{{ error }}</p>{% endif %}
+        <form method="post">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <label>Username</label>
+          <input name="username" autocomplete="username" required>
+          <label>Password</label>
+          <input type="password" name="password"
+                 autocomplete="current-password" required>
+          <button class="btn primary" type="submit">Login</button>
+        </form>
+      </div>
+    </div>
+    """, error=None, csrf=csrf_token(), anime_gif_url=ANIME_GIF_URL)
+
+
+@app.post("/login")
+def login_post():
+    if not rate_limit("admin_login", 8, 60):
+        return render_template_string(
+            BASE_STYLE + "<div class='wrap'><div class='card'><p class='bad'>Too many login attempts. Try again later.</p></div></div>"
+        ), 429
+
+    require_csrf()
+
+    username = request.form.get("username", "")
+    password = request.form.get("password", "")
+
+    if hmac.compare_digest(username, ADMIN_USER) and hmac.compare_digest(password, ADMIN_PASS):
+        session.clear()
+        session.permanent = True
+        session["admin"] = True
+        rotate_csrf()
+        audit("ADMIN_LOG
