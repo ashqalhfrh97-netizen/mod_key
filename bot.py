@@ -1,4 +1,5 @@
 
+
 import os
 import json
 import sqlite3
@@ -6,13 +7,18 @@ import secrets
 import hashlib
 import hmac
 import time
+import re
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from urllib.parse import urlparse
+from urllib.request import Request as URLRequest, urlopen
+from urllib.error import URLError, HTTPError
+import threading
+from io import BytesIO
 
 from flask import (
     Flask, request, jsonify, session, redirect,
-    url_for, render_template_string, abort, make_response
+    url_for, render_template_string, abort, make_response, send_file
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -24,7 +30,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 #
 # Environment variables:
 #   ADMIN_USER=your_admin_username
-#   ADMIN_PASS=your_strong_admin_password (or ADMIN_PASSWORD_HASH)
+#   ADMIN_PASS=your_strong_admin_password
 #   SECRET_KEY=a_long_random_secret
 #   PORT=8080
 #
@@ -32,8 +38,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 #   DB_PATH=modpanel.db
 #   SESSION_HOURS=12
 #   API_SESSION_MINUTES=30
-#   ANIME_GIF_URL=https://your-host/path/background.gif (optional)
-#   TRUST_PROXY_HEADERS=1 only behind a trusted reverse proxy
+#   TELEGRAM_BOT_TOKEN=...
+#   TELEGRAM_ADMIN_ID=123456789
+#   TELEGRAM_POLLING=1  (single server instance)
 #
 # IMPORTANT:
 # - The server is the source of truth for keys/expiry/permissions.
@@ -43,29 +50,24 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
-ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
-SECRET_KEY = os.environ.get("SECRET_KEY", "")
+ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
 
-if not ADMIN_USER or not (ADMIN_PASS or ADMIN_PASSWORD_HASH) or len(SECRET_KEY) < 32:
+if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
     raise RuntimeError(
-        "Configure ADMIN_USER, ADMIN_PASS (or ADMIN_PASSWORD_HASH), and "
-        "a SECRET_KEY of at least 32 characters in the deployment environment."
+        "Set ADMIN_USER, ADMIN_PASS and SECRET_KEY environment variables "
+        "before starting the server."
     )
 
 app.secret_key = SECRET_KEY
 
 # Full-page animated background GIF. You can replace this URL later
 # without changing the rest of the application.
-ANIME_GIF_URL = os.environ.get("ANIME_GIF_URL", "").strip()
-if ANIME_GIF_URL:
-    _gif_url_parts = urlparse(ANIME_GIF_URL)
-    if not (
-        (_gif_url_parts.scheme == "https" and _gif_url_parts.netloc)
-        or ANIME_GIF_URL.startswith("/static/")
-    ):
-        raise RuntimeError("ANIME_GIF_URL must be an HTTPS URL or a /static/ path.")
+ANIME_GIF_URL = os.environ.get(
+    "ANIME_GIF_URL",
+    "https://media.tenor.com/images/7f3d3c7c7e5f4f7d8e7f7c6c4a0b0d4b/tenor.gif"
+).strip()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=True,       # HTTPS in production
@@ -77,6 +79,14 @@ app.config.update(
 
 DB_PATH = os.environ.get("DB_PATH", "modpanel.db")
 API_SESSION_MINUTES = int(os.environ.get("API_SESSION_MINUTES", "30"))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "8299101176").strip()
+TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "MoldesKeysBot").strip().lstrip("@")
+TELEGRAM_BOT_NAME = os.environ.get("TELEGRAM_BOT_NAME", "Key EX25").strip()
+TELEGRAM_POLLING = os.environ.get("TELEGRAM_POLLING", "1") == "1"
+BOT_POLL_OFFSET = 0
+BOT_THREAD_STARTED = False
+BOT_THREAD_LOCK = threading.Lock()
 
 # Small in-memory rate limiter. For a single private server this is useful.
 # If you later run multiple workers/instances, move rate limiting to Redis.
@@ -186,29 +196,79 @@ def init_db():
             FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE,
             FOREIGN KEY(feature_id) REFERENCES feature_permissions(feature_id) ON DELETE CASCADE
         );
+        """)
 
-        CREATE TABLE IF NOT EXISTS rate_limit_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bucket TEXT NOT NULL,
-            client_ip TEXT NOT NULL,
-            created_at REAL NOT NULL
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS telegram_users (
+            telegram_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            last_name TEXT DEFAULT '',
+            updated_at TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_rate_limit_lookup
-            ON rate_limit_events(bucket, client_ip, created_at);
-
+        CREATE TABLE IF NOT EXISTS subscription_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            payment_proof TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT DEFAULT '',
+            admin_note TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL UNIQUE,
+            telegram_id INTEGER NOT NULL,
+            key_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
+            starts_at TEXT NOT NULL,
+            expires_at TEXT,
+            device_limit INTEGER NOT NULL DEFAULT 1,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(request_id) REFERENCES subscription_requests(id),
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS telegram_link_codes (
+            code_hash TEXT PRIMARY KEY,
+            hwid TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            telegram_id INTEGER,
+            linked_at TEXT DEFAULT '',
+            used_at TEXT DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS security_blocks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             block_type TEXT NOT NULL CHECK(block_type IN ('ip','hwid')),
             subject TEXT NOT NULL,
-            reason TEXT NOT NULL DEFAULT '',
+            reason TEXT DEFAULT '',
             created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
-            created_by TEXT NOT NULL DEFAULT 'admin',
-            active INTEGER NOT NULL DEFAULT 1
+            expires_at TEXT DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(block_type, subject)
         );
-        CREATE INDEX IF NOT EXISTS idx_security_blocks_lookup
-            ON security_blocks(block_type, subject, active, expires_at);
+        CREATE INDEX IF NOT EXISTS idx_security_blocks_active
+            ON security_blocks(block_type, active, subject);
+        CREATE TABLE IF NOT EXISTS rate_limit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bucket TEXT NOT NULL,
+            subject TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rate_limit_events_lookup
+            ON rate_limit_events(bucket, subject, created_at);
+        CREATE INDEX IF NOT EXISTS idx_subscriptions_telegram
+            ON subscriptions(telegram_id, active);
+        CREATE INDEX IF NOT EXISTS idx_requests_status
+            ON subscription_requests(status, created_at);
         """)
+
+        # Safe additive migration for databases created by earlier versions.
+        user_columns = {row["name"] for row in c.execute("PRAGMA table_info(telegram_users)").fetchall()}
+        if "photo_file_id" not in user_columns:
+            c.execute("ALTER TABLE telegram_users ADD COLUMN photo_file_id TEXT DEFAULT ''")
 
         defaults = {
             "menu_enabled": "1",
@@ -302,42 +362,41 @@ def set_setting(name, value):
 # ============================================================
 
 def rate_limit(bucket, limit, window_seconds):
-    """Persistent sliding-window limiter shared by workers using the same SQLite DB."""
-    client_ip = current_client_ip() or "unknown"
+    """Persistent per-IP sliding-window limiter shared across server workers."""
     now = time.time()
-    cutoff = now - int(window_seconds)
+    subject = current_client_ip() or "unknown"
+
     try:
         with db() as c:
-            c.execute("BEGIN IMMEDIATE")
-            c.execute("DELETE FROM rate_limit_events WHERE created_at < ?", (now - 86400,))
-            count = c.execute("""
-                SELECT COUNT(*) FROM rate_limit_events
-                WHERE bucket=? AND client_ip=? AND created_at>=?
-            """, (bucket, client_ip, cutoff)).fetchone()[0]
-            if count >= int(limit):
-                c.commit()
+            blocked = c.execute("""
+                SELECT id FROM security_blocks
+                WHERE block_type='ip' AND subject=? AND active=1
+                  AND (expires_at='' OR expires_at > ?)
+                LIMIT 1
+            """, (subject, iso(now_utc()))).fetchone()
+            if blocked:
                 return False
+
+            c.execute(
+                "DELETE FROM rate_limit_events WHERE created_at < ?",
+                (now - max(float(window_seconds), 3600.0),)
+            )
+            count = c.execute("""
+                SELECT COUNT(*) AS n FROM rate_limit_events
+                WHERE bucket=? AND subject=? AND created_at > ?
+            """, (str(bucket), subject, now - float(window_seconds))).fetchone()["n"]
+
+            if count >= int(limit):
+                return False
+
             c.execute("""
-                INSERT INTO rate_limit_events(bucket,client_ip,created_at)
+                INSERT INTO rate_limit_events(bucket,subject,created_at)
                 VALUES(?,?,?)
-            """, (bucket, client_ip, now))
-            c.commit()
+            """, (str(bucket), subject, now))
             return True
     except sqlite3.Error:
-        app.logger.exception("Rate limiter database error")
+        # Fail closed if the limiter database is temporarily unavailable.
         return False
-
-
-def is_security_blocked(block_type, subject):
-    if not subject:
-        return False
-    with db() as c:
-        row = c.execute("""
-            SELECT id FROM security_blocks
-            WHERE block_type=? AND subject=? AND active=1 AND expires_at>?
-            ORDER BY id DESC LIMIT 1
-        """, (block_type, str(subject)[:256], iso(now_utc()))).fetchone()
-    return row is not None
 
 
 # ============================================================
@@ -400,15 +459,15 @@ def hash_token(token):
 
 
 def current_client_ip():
-    # Forwarded headers are trusted only behind an explicitly configured proxy.
-    remote = request.remote_addr or ""
-    if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1":
-        forwarded = request.headers.get("X-Forwarded-For", "")
-        if forwarded:
-            candidate = forwarded.split(",", 1)[0].strip()
-            if candidate and len(candidate) <= 64:
-                return candidate
-    return remote
+    remote_ip = (request.remote_addr or "unknown").strip()
+    if os.environ.get("TRUST_PROXY_HEADERS", "0").strip() != "1":
+        return remote_ip
+
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    candidate = forwarded.split(",", 1)[0].strip()
+    if candidate and len(candidate) <= 64 and re.fullmatch(r"[0-9a-fA-F:.]+", candidate):
+        return candidate
+    return remote_ip
 
 
 # ============================================================
@@ -549,9 +608,6 @@ def api_health():
 
 @app.post("/api/v1/auth/login")
 def api_login():
-    client_ip = current_client_ip()
-    if is_security_blocked("ip", client_ip):
-        return jsonify({"success": False, "message": "Access temporarily blocked"}), 403
     if not rate_limit("api_login", 12, 60):
         return jsonify({
             "success": False,
@@ -565,9 +621,6 @@ def api_login():
 
     if len(hwid) > 256:
         return jsonify({"success": False, "message": "Invalid device id"}), 400
-    if is_security_blocked("hwid", hwid):
-        audit("BLOCKED_DEVICE_LOGIN", f"hwid={hwid[:16]}...", client_ip)
-        return jsonify({"success": False, "message": "Device temporarily blocked"}), 403
 
     key_row, device, error = valid_key_for_device(key_value, hwid, True)
 
@@ -665,11 +718,6 @@ def require_api_session():
         if not row:
             return None, "Invalid session"
 
-        if (is_security_blocked("ip", current_client_ip())
-                or is_security_blocked("hwid", row["hwid"])):
-            c.execute("UPDATE api_sessions SET revoked=1 WHERE id=?", (row["id"],))
-            return None, "Access temporarily blocked"
-
         session_exp = parse_iso(row["expires_at"])
         key_exp = parse_iso(row["key_expires_at"])
 
@@ -685,6 +733,16 @@ def require_api_session():
 
         if key_exp and key_exp <= now_utc():
             return None, "Key expired"
+
+        blocked_hwid = c.execute("""
+            SELECT id FROM security_blocks
+            WHERE block_type='hwid' AND subject=? AND active=1
+              AND (expires_at='' OR expires_at > ?)
+            LIMIT 1
+        """, (row["hwid"], iso(now_utc()))).fetchone()
+        if blocked_hwid:
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE id=?", (row["id"],))
+            return None, "Device blocked"
 
         # The device must still be registered for the key.
         device = c.execute("""
@@ -754,16 +812,495 @@ def api_logout():
 
 
 # ============================================================
+# TELEGRAM SUBSCRIPTIONS
+# ============================================================
+
+PLAN_DAYS = {"week": 7, "month": 30, "year": 365, "lifetime": 0}
+PLAN_LABELS = {"week": "أسبوع واحد", "month": "شهر واحد", "year": "سنة واحدة", "lifetime": "اشتراك دائم"}
+
+
+def telegram_api(method, payload=None):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Telegram bot is not configured")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = URLRequest(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(req, timeout=40) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Telegram API error"))
+    return result.get("result")
+
+
+def bot_send(chat_id, text, reply_markup=None):
+    payload = {"chat_id": int(chat_id), "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return telegram_api("sendMessage", payload)
+
+
+def bot_send_photo(chat_id, photo, caption="", reply_markup=None):
+    """Forward a Telegram photo file_id to the admin with optional review buttons."""
+    payload = {"chat_id": int(chat_id), "photo": photo, "caption": caption[:1024]}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return telegram_api("sendPhoto", payload)
+
+
+def save_telegram_user(user):
+    tid = int(user.get("id"))
+    with db() as c:
+        c.execute("""
+            INSERT INTO telegram_users(telegram_id,username,first_name,last_name,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+              username=excluded.username, first_name=excluded.first_name,
+              last_name=excluded.last_name, updated_at=excluded.updated_at
+        """, (tid, user.get("username", ""), user.get("first_name", ""),
+              user.get("last_name", ""), iso(now_utc())))
+
+
+def refresh_telegram_photo(telegram_id):
+    """Store and return the largest available Telegram profile-photo file_id."""
+    if not TELEGRAM_BOT_TOKEN:
+        return ""
+    try:
+        result = telegram_api(
+            "getUserProfilePhotos",
+            {"user_id": int(telegram_id), "offset": 0, "limit": 1}
+        )
+        photos = result.get("photos") or []
+        file_id = photos[0][-1].get("file_id", "") if photos and photos[0] else ""
+        with db() as c:
+            c.execute(
+                "UPDATE telegram_users SET photo_file_id=? WHERE telegram_id=?",
+                (file_id, int(telegram_id))
+            )
+        return file_id
+    except Exception as exc:
+        audit("TELEGRAM_PHOTO_ERROR", str(exc)[:300])
+        return ""
+
+
+def notify_admin_new_subscription_request(request_id, user, plan):
+    """Send the applicant's Telegram profile photo and request details to the admin."""
+    if not TELEGRAM_ADMIN_ID:
+        return
+
+    username = user.get("username") or "بدون اسم مستخدم"
+    full_name = " ".join(
+        part for part in (user.get("first_name", ""), user.get("last_name", "")) if part
+    ) or "غير متوفر"
+    caption = (
+        f"طلب اشتراك جديد #{request_id}\n"
+        f"الاسم: {full_name}\n"
+        f"المستخدم: @{username}\n"
+        f"معرّف تيليجرام: {user.get('id')}\n"
+        f"الخطة: {PLAN_LABELS.get(plan, plan)}\n"
+        "هذه صورة الملف الشخصي في تيليجرام. بانتظار صورة حساب اللعبة."
+    )
+
+    with db() as c:
+        row = c.execute(
+            "SELECT photo_file_id FROM telegram_users WHERE telegram_id=?",
+            (int(user["id"]),)
+        ).fetchone()
+    profile_photo = row["photo_file_id"] if row else ""
+
+    try:
+        if profile_photo:
+            bot_send_photo(TELEGRAM_ADMIN_ID, profile_photo, caption)
+        else:
+            bot_send(
+                TELEGRAM_ADMIN_ID,
+                caption + "\n\nلم يضع المستخدم صورة شخصية في تيليجرام أو تعذر جلبها."
+            )
+    except Exception as exc:
+        audit("TELEGRAM_PROFILE_FORWARD_ERROR", str(exc)[:500])
+        try:
+            bot_send(TELEGRAM_ADMIN_ID, caption + "\n\nتعذر إرسال الصورة الشخصية.")
+        except Exception as notify_exc:
+            audit("TELEGRAM_ADMIN_NOTIFY_ERROR", str(notify_exc)[:500])
+
+
+def active_subscription(telegram_id):
+    with db() as c:
+        rows = c.execute("""
+            SELECT s.*, k.active AS key_active, k.expires_at AS key_expires_at
+            FROM subscriptions s JOIN keys k ON k.id=s.key_id
+            WHERE s.telegram_id=? AND s.active=1
+            ORDER BY s.id DESC
+        """, (int(telegram_id),)).fetchall()
+    for row in rows:
+        exp = parse_iso(row["expires_at"])
+        if row["key_active"] and (not exp or exp > now_utc()):
+            return row
+    return None
+
+
+def approve_subscription_request(request_id, reviewer="admin"):
+    with db() as c:
+        req = c.execute("SELECT * FROM subscription_requests WHERE id=?", (request_id,)).fetchone()
+        if not req:
+            return False, "Request not found"
+        if req["status"] != "pending":
+            return False, "تمت مراجعة هذا الطلب مسبقاً"
+        if not (req["payment_proof"] or "").startswith("photo_file_id:"):
+            return False, "لا يمكن قبول الطلب قبل استلام صورة حساب اللعبة"
+        days = PLAN_DAYS.get(req["plan"])
+        if days is None:
+            return False, "Invalid plan"
+        try:
+            device_limit = max(1, min(100, int(get_setting("telegram_device_limit", "1"))))
+        except ValueError:
+            device_limit = 1
+        key_value = generate_key()
+        created = now_utc()
+        expires = None if days == 0 else iso(created + timedelta(days=days))
+        note = f"Telegram:{req['telegram_id']} | Request:{request_id}"
+        cur = c.execute("""
+            INSERT INTO keys(key,active,device_limit,expires_at,created_at,note)
+            VALUES(?,1,?,?,?,?)
+        """, (key_value, device_limit, expires, iso(created), note))
+        key_id = cur.lastrowid
+        c.execute("""
+            INSERT INTO subscriptions(request_id,telegram_id,key_id,plan,starts_at,expires_at,device_limit,active,created_at)
+            VALUES(?,?,?,?,?,?,?,1,?)
+        """, (request_id, req["telegram_id"], key_id, req["plan"], iso(created), expires, device_limit, iso(created)))
+        c.execute("UPDATE subscription_requests SET status='approved', reviewed_at=? WHERE id=?",
+                  (iso(created), request_id))
+    audit("TELEGRAM_SUBSCRIPTION_APPROVED", f"request={request_id} telegram_id={req['telegram_id']} by={reviewer}")
+    return True, {"telegram_id": req["telegram_id"], "expires_at": expires, "device_limit": device_limit}
+
+
+def reject_subscription_request(request_id, reviewer="admin"):
+    with db() as c:
+        cur = c.execute("""
+            UPDATE subscription_requests SET status='rejected', reviewed_at=?
+            WHERE id=? AND status='pending'
+        """, (iso(now_utc()), request_id))
+        changed = cur.rowcount
+        row = c.execute("SELECT telegram_id FROM subscription_requests WHERE id=?", (request_id,)).fetchone()
+    if changed:
+        audit("TELEGRAM_SUBSCRIPTION_REJECTED", f"request={request_id} by={reviewer}")
+        return True, row["telegram_id"] if row else None
+    return False, None
+
+
+def bot_handle_update(update):
+    message = update.get("message") or update.get("edited_message")
+    callback = update.get("callback_query")
+    if callback:
+        user = callback.get("from", {})
+        save_telegram_user(user)
+        refresh_telegram_photo(user.get("id"))
+        data = callback.get("data", "")
+        callback_id = callback.get("id")
+        if data.startswith("plan:"):
+            plan = data.split(":", 1)[1]
+            if plan not in PLAN_DAYS:
+                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "خطة غير صحيحة"})
+                return
+            with db() as c:
+                cur = c.execute("""
+                    INSERT INTO subscription_requests(telegram_id,plan,status,created_at)
+                    VALUES(?,?,'pending',?)
+                """, (int(user["id"]), plan, iso(now_utc())))
+                request_id = cur.lastrowid
+            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تم إنشاء الطلب"})
+            instructions = get_setting("payment_instructions", "").strip()
+            extra = f"\n\nملاحظة: {instructions}" if instructions else ""
+            bot_send(user["id"],
+                f"تم إنشاء طلب الاشتراك رقم #{request_id} ({PLAN_LABELS[plan]}).\n\n"
+                "الخطوة التالية: أرسل صورة واضحة من داخل لعبة Bounty Rush يظهر فيها حسابك أو معلومات اللاعب. "
+                "يمكنك إضافة رقم اللاعب أو اسمه في وصف الصورة.\n\n"
+                "لا ترسل كلمة مرور أو رمز تسجيل دخول." + extra)
+            notify_admin_new_subscription_request(request_id, user, plan)
+            return
+        if data.startswith("req:"):
+            if not TELEGRAM_ADMIN_ID or str(user.get("id")) != TELEGRAM_ADMIN_ID:
+                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "غير مصرح لك", "show_alert": True})
+                return
+            try:
+                _, action, raw_id = data.split(":", 2)
+                request_id = int(raw_id)
+            except (ValueError, TypeError):
+                return
+            if action == "approve":
+                ok, result = approve_subscription_request(request_id, str(user.get("id")))
+                if ok:
+                    expiry = result["expires_at"] or "دائم"
+                    bot_send(result["telegram_id"],
+                        f"تمت الموافقة على اشتراكك!\nانتهى الاشتراك: {expiry}\n\n"
+                        "افتح التطبيق وأنشئ رمز ربط مؤقت، ثم أرسل الرمز هنا لربط حسابك.")
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تمت الموافقة"})
+                    bot_send(user["id"], f"تم قبول الطلب رقم #{request_id}. عدد الأجهزة المسموح: {result['device_limit']}.")
+                else:
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": str(result), "show_alert": True})
+            elif action == "reject":
+                ok, target = reject_subscription_request(request_id, str(user.get("id")))
+                if ok and target:
+                    bot_send(target, f"لم تتم الموافقة على طلب الاشتراك رقم #{request_id}. يمكنك التواصل مع الإدارة للاستفسار.")
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تم رفض الطلب"})
+                else:
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "تمت مراجعة الطلب مسبقاً", "show_alert": True})
+            return
+    if not message:
+        return
+    user = message.get("from", {})
+    chat_id = message.get("chat", {}).get("id")
+    if not user or not chat_id:
+        return
+    save_telegram_user(user)
+    refresh_telegram_photo(user.get("id"))
+    text_value = (message.get("text") or "").strip()
+
+    # Owner-only instructions.
+    if text_value.split(" ", 1)[0].split("@", 1)[0] == "/adminhelp":
+        if not TELEGRAM_ADMIN_ID or str(user.get("id")) != TELEGRAM_ADMIN_ID:
+            bot_send(chat_id, "هذا الأمر مخصص للإدارة فقط.")
+            return
+        bot_send(chat_id,
+            "تعليمات مراجعة طلبات الاشتراك:\n\n"
+            "1) اختر الطلب من رسالة البوت التي تصلك عند إنشاء اشتراك جديد.\n"
+            "2) انتظر وصول صورة حساب Bounty Rush؛ ستصلك الصورة نفسها مع رقم الطلب وبيانات صاحبه.\n"
+            "3) افحص أن الصورة واضحة وتُظهر معلومات الحساب المطلوبة.\n"
+            "4) اضغط (موافقة) لتفعيل الاشتراك تلقائياً، أو (رفض) إذا كانت الصورة غير واضحة أو لا تخص الحساب.\n"
+            "5) يمكن أيضاً مراجعة الطلبات من لوحة التحكم ثم صفحة اشتراكات تيليجرام.\n\n"
+            "مهم: لا تطلب كلمة مرور اللعبة أو رموز تسجيل الدخول من أي شخص. راجع الصور ومعلومات الحساب الظاهرة فقط.")
+        return
+
+    if text_value.startswith("/start"):
+        markup = {"inline_keyboard": [
+            [{"text": "أسبوع واحد", "callback_data": "plan:week"}, {"text": "شهر واحد", "callback_data": "plan:month"}],
+            [{"text": "سنة واحدة", "callback_data": "plan:year"}, {"text": "اشتراك دائم", "callback_data": "plan:lifetime"}]
+        ]}
+        bot_send(
+            chat_id,
+            "أهلاً بك! اختر مدة الاشتراك:\n\n"
+            "عند تقديم الطلب، سيتم إرسال صورة ملفك الشخصي المتاحة في تيليجرام إلى الإدارة للمراجعة، "
+            "وبعدها سيُطلب منك إرسال صورة حسابك من داخل لعبة Bounty Rush.\n"
+            "لا ترسل كلمة مرور أو رمز تسجيل الدخول.",
+            markup
+        )
+        return
+
+    # A photo from the game account is the only accepted subscription proof.
+    if message.get("photo"):
+        with db() as c:
+            req = c.execute("""
+                SELECT * FROM subscription_requests
+                WHERE telegram_id=? AND status='pending'
+                ORDER BY id DESC LIMIT 1
+            """, (int(user["id"]),)).fetchone()
+            if req:
+                file_id = message["photo"][-1].get("file_id", "")
+                caption_text = (message.get("caption") or "").strip()
+                proof_value = "photo_file_id:" + file_id + "\ncaption:" + caption_text
+                c.execute("UPDATE subscription_requests SET payment_proof=? WHERE id=?", (proof_value[:1500], req["id"]))
+        if not req:
+            bot_send(chat_id, "لم أجد طلب اشتراك معلّقاً. أرسل /start واختر مدة الاشتراك أولاً.")
+            return
+        if not file_id:
+            bot_send(chat_id, "لم أتمكن من قراءة الصورة. أعد إرسال لقطة الشاشة من فضلك.")
+            return
+        if TELEGRAM_ADMIN_ID:
+            caption = (
+                f"صورة حساب لطلب الاشتراك #{req['id']}\n"
+                f"المستخدم: {user.get('first_name','')} (@{user.get('username','')})\n"
+                f"معرّف تيليجرام: {user['id']}\n"
+                f"الخطة: {PLAN_LABELS.get(req['plan'], req['plan'])}\n"
+                f"معلومات إضافية: {caption_text or 'لا يوجد'}"
+            )
+            markup = {"inline_keyboard": [[
+                {"text": "موافقة", "callback_data": f"req:approve:{req['id']}"},
+                {"text": "رفض", "callback_data": f"req:reject:{req['id']}"}
+            ]]}
+            try:
+                bot_send_photo(TELEGRAM_ADMIN_ID, file_id, caption, markup)
+            except Exception as exc:
+                audit("TELEGRAM_PROOF_FORWARD_ERROR", str(exc)[:500])
+                bot_send(chat_id, "تم استلام الصورة، لكن تعذر إرسالها للإدارة حالياً. حاول مرة أخرى بعد قليل.")
+                return
+        bot_send(chat_id, "وصلت صورة الحساب وتم إرسالها إلى الإدارة للمراجعة. انتظر الرد هنا.")
+        return
+
+    # Text is not accepted as proof; users must send an in-game screenshot.
+    if text_value:
+        with db() as c:
+            pending = c.execute("""
+                SELECT id FROM subscription_requests
+                WHERE telegram_id=? AND status='pending'
+                ORDER BY id DESC LIMIT 1
+            """, (int(user["id"]),)).fetchone()
+        if pending and not text_value.startswith("/"):
+            bot_send(chat_id, "لا نعتمد النصوص أو أرقام التحويل كإثبات. أرسل صورة واضحة لحسابك من داخل لعبة Bounty Rush، ويمكنك كتابة رقم اللاعب في وصف الصورة.")
+            return
+
+    # Link codes are short, one-time codes generated by the app.
+    if text_value and len(text_value) <= 32 and text_value.replace("-", "").isalnum():
+        digest = hash_token(text_value.upper())
+        with db() as c:
+            link = c.execute("SELECT * FROM telegram_link_codes WHERE code_hash=?", (digest,)).fetchone()
+            sub = active_subscription(user["id"])
+            if link and not link["used_at"] and parse_iso(link["expires_at"]) and parse_iso(link["expires_at"]) > now_utc() and sub:
+                c.execute("UPDATE telegram_link_codes SET telegram_id=?,linked_at=? WHERE code_hash=? AND telegram_id IS NULL",
+                          (int(user["id"]), iso(now_utc()), digest))
+                linked = c.execute("SELECT changes() n").fetchone()["n"] == 1
+            else:
+                linked = False
+        if linked:
+            bot_send(chat_id, "تم ربط الحساب بنجاح! ارجع إلى التطبيق لإكمال تسجيل الدخول.")
+        else:
+            bot_send(chat_id, "الرمز غير صالح. تأكد من تفعيل اشتراكك وأن الرمز ما زال صالحاً.")
+
+
+def telegram_poll_loop():
+    global BOT_POLL_OFFSET
+    while True:
+        try:
+            updates = telegram_api("getUpdates", {"offset": BOT_POLL_OFFSET, "timeout": 25, "allowed_updates": ["message", "callback_query"]})
+            for item in updates or []:
+                BOT_POLL_OFFSET = max(BOT_POLL_OFFSET, int(item.get("update_id", 0)) + 1)
+                try:
+                    bot_handle_update(item)
+                except Exception as exc:
+                    audit("TELEGRAM_UPDATE_ERROR", str(exc)[:500])
+        except Exception as exc:
+            audit("TELEGRAM_POLL_ERROR", str(exc)[:500])
+            time.sleep(5)
+
+
+def start_telegram_polling():
+    global BOT_THREAD_STARTED
+    if not TELEGRAM_POLLING or not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
+        return
+    with BOT_THREAD_LOCK:
+        if BOT_THREAD_STARTED:
+            return
+        thread = threading.Thread(target=telegram_poll_loop, daemon=True, name="telegram-polling")
+        thread.start()
+        BOT_THREAD_STARTED = True
+
+
+@app.post("/api/v1/telegram/link-code")
+def api_create_telegram_link_code():
+    if not rate_limit("telegram_link_code", 8, 60):
+        return jsonify({"success": False, "message": "Too many attempts"}), 429
+    data = request.get_json(silent=True) or {}
+    hwid = str(data.get("hwid", "")).strip()
+    if not hwid or len(hwid) > 256:
+        return jsonify({"success": False, "message": "Invalid device id"}), 400
+    code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+    created = now_utc()
+    expires = created + timedelta(minutes=5)
+    with db() as c:
+        c.execute("DELETE FROM telegram_link_codes WHERE expires_at<? OR used_at!=''", (iso(created),))
+        c.execute("INSERT INTO telegram_link_codes(code_hash,hwid,created_at,expires_at) VALUES(?,?,?,?)",
+                  (hash_token(code), hwid, iso(created), iso(expires)))
+    return jsonify({"success": True, "link_code": code, "expires_at": iso(expires), "bot_username": TELEGRAM_BOT_USERNAME})
+
+
+@app.get("/api/v1/telegram/avatar/<int:telegram_id>")
+def api_telegram_avatar(telegram_id):
+    if not TELEGRAM_BOT_TOKEN:
+        abort(404)
+    sub = active_subscription(telegram_id)
+    if not sub:
+        abort(404)
+    with db() as c:
+        row = c.execute("SELECT photo_file_id FROM telegram_users WHERE telegram_id=?", (telegram_id,)).fetchone()
+    if not row or not row["photo_file_id"]:
+        abort(404)
+    try:
+        file_info = telegram_api("getFile", {"file_id": row["photo_file_id"]})
+        file_path = file_info.get("file_path")
+        if not file_path:
+            abort(404)
+        url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        with urlopen(url, timeout=15) as response:
+            content = response.read(2 * 1024 * 1024 + 1)
+        if len(content) > 2 * 1024 * 1024:
+            abort(413)
+        return send_file(BytesIO(content), mimetype="image/jpeg", max_age=300)
+    except (URLError, HTTPError, RuntimeError):
+        abort(404)
+
+
+@app.post("/api/v1/telegram/login")
+def api_telegram_login():
+    if not rate_limit("telegram_login", 12, 60):
+        return jsonify({"success": False, "message": "Too many attempts"}), 429
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("link_code", "")).strip().upper()
+    hwid = str(data.get("hwid", "")).strip()
+    if not code or not hwid or len(hwid) > 256:
+        return jsonify({"success": False, "message": "Missing link code or device id"}), 400
+    digest = hash_token(code)
+    with db() as c:
+        link = c.execute("SELECT * FROM telegram_link_codes WHERE code_hash=? AND hwid=?", (digest, hwid)).fetchone()
+        if not link or not link["telegram_id"] or link["used_at"] or not parse_iso(link["expires_at"]) or parse_iso(link["expires_at"]) <= now_utc():
+            return jsonify({"success": False, "message": "Code is not linked or has expired"}), 403
+        telegram_id = int(link["telegram_id"])
+        sub = c.execute("""
+            SELECT s.id AS subscription_id, s.key_id, s.device_limit,
+                   s.expires_at AS subscription_expires_at, s.active AS subscription_active,
+                   k.active AS key_active, k.expires_at AS key_expires_at
+            FROM subscriptions s JOIN keys k ON k.id=s.key_id
+            WHERE s.telegram_id=? AND s.active=1
+            ORDER BY s.id DESC LIMIT 1
+        """, (telegram_id,)).fetchone()
+        if not sub or not sub["subscription_active"] or not sub["key_active"]:
+            return jsonify({"success": False, "message": "No active subscription"}), 403
+        if sub["subscription_expires_at"] and parse_iso(sub["subscription_expires_at"]) <= now_utc():
+            return jsonify({"success": False, "message": "Subscription expired"}), 403
+        if sub["key_expires_at"] and parse_iso(sub["key_expires_at"]) <= now_utc():
+            return jsonify({"success": False, "message": "Subscription expired"}), 403
+        key_id = sub["key_id"]
+        device = c.execute("SELECT * FROM devices WHERE key_id=? AND hwid=?", (key_id, hwid)).fetchone()
+        count = c.execute("SELECT COUNT(*) n FROM devices WHERE key_id=?", (key_id,)).fetchone()["n"]
+        if not device and count >= sub["device_limit"]:
+            return jsonify({"success": False, "message": "Device limit reached"}), 403
+        now_text = iso(now_utc())
+        if device:
+            c.execute("UPDATE devices SET last_seen=? WHERE id=?", (now_text, device["id"]))
+        else:
+            c.execute("INSERT INTO devices(key_id,hwid,first_seen,last_seen,label) VALUES(?,?,?,?,?)",
+                      (key_id, hwid, now_text, now_text, f"Telegram:{telegram_id}"))
+        c.execute("UPDATE telegram_link_codes SET used_at=? WHERE code_hash=?", (now_text, digest))
+        token = secrets.token_urlsafe(48)
+        expires = now_utc() + timedelta(minutes=API_SESSION_MINUTES)
+        c.execute("INSERT INTO api_sessions(token_hash,key_id,hwid,created_at,expires_at,last_seen) VALUES(?,?,?,?,?,?)",
+                  (hash_token(token), key_id, hwid, now_text, iso(expires), now_text))
+        profile = c.execute("SELECT username,first_name,last_name FROM telegram_users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        key_row = c.execute("SELECT * FROM keys WHERE id=?", (key_id,)).fetchone()
+    menu = menu_payload(key_row)
+    if not menu["menu_enabled"] or menu["maintenance"]:
+        with db() as c:
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE token_hash=?", (hash_token(token),))
+        return jsonify({"success": False, "message": "MOD MENU unavailable"}), 503
+    audit("TELEGRAM_LOGIN_OK", f"telegram_id={telegram_id} hwid={hwid[:16]}...")
+    return jsonify({"success": True, "session_token": token, "session_expires_at": iso(expires),
+                    "key_expires_at": key_row["expires_at"], "telegram": {"id": telegram_id,
+                    "username": profile["username"] if profile else "",
+                    "first_name": profile["first_name"] if profile else "",
+                    "last_name": profile["last_name"] if profile else "",
+                    "avatar_url": f"/api/v1/telegram/avatar/{telegram_id}"},
+                    "menu_version": menu["menu_version"], "min_client_version": menu["min_client_version"],
+                    "permissions": menu["permissions"], "announcement": menu["announcement"]})
+
+
+# ============================================================
 # ADMIN WEB PANEL
 # ============================================================
 
 BASE_STYLE = """
 <style>
-:root{--bg:#070914;--panel:#101426;--line:#30324f;--text:#f3f4ff;--muted:#a2a8c4;--blue:#8b5cf6;--green:#34d399;--red:#fb7185}
+:root{--bg:#080612;--panel:#151027;--line:#34264f;--text:#f4efff;--muted:#b0a2c8;--blue:#a78bfa;--green:#34d399;--red:#fb7185}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
-html{min-height:100%;background:#050812}
-body{margin:0;background:#050812;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
-body::before{content:"";position:fixed;inset:0;z-index:0;background-image:{% if anime_gif_url %}url("{{ anime_gif_url }}"){% else %}radial-gradient(circle at 18% 20%,rgba(99,102,241,.22),transparent 38%),radial-gradient(circle at 82% 75%,rgba(14,165,233,.18),transparent 40%){% endif %};background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.40;filter:saturate(1.18) contrast(1.08);pointer-events:none}
+html{min-height:100%;background:#080612}
+body{margin:0;background:#080612;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.40;filter:saturate(1.18) contrast(1.08);pointer-events:none}
 body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(180deg,rgba(3,6,15,.48),rgba(3,6,15,.72));pointer-events:none}
 
 a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
@@ -771,7 +1308,7 @@ a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;padding:14px 16px;background:rgba(16,25,39,.9);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;position:sticky;top:12px;z-index:20;box-shadow:0 18px 55px rgba(0,0,0,.3)}
 .brand{display:flex;align-items:center;gap:11px;font-weight:800}.brand-dot{width:11px;height:11px;border-radius:50%;background:var(--green);box-shadow:0 0 18px rgba(52,211,153,.75)}
 .nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#172337;color:#eaf2ff;border:1px solid #2c3e57;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#4d6b94;background:#1c2c44}
-.btn.primary{background:linear-gradient(135deg,#6d28d9,#2563eb);border-color:#8b5cf6}.btn.danger{background:#65152b;border-color:#a83b59}
+.btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.btn.danger{background:#65152b;border-color:#a83b59}
 .hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
 .card{background:linear-gradient(180deg,rgba(18,29,45,.97),rgba(12,20,32,.97));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
 h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}.stat{font-size:30px;font-weight:850;margin-top:5px}.small{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
@@ -793,8 +1330,9 @@ def page(title, body):
               <a href="{{ url_for('dashboard') }}">Dashboard</a>
               <a href="{{ url_for('keys_page') }}">Keys</a>
               <a href="{{ url_for('devices_page') }}">Devices</a>
-              <a href="{{ url_for('security_page') }}">Security</a>
               <a href="{{ url_for('features_page') }}">Permissions</a>
+              <a href="{{ url_for('security_page') }}">Security</a>
+              <a href="{{ url_for('telegram_subscriptions_page') }}">Telegram Subscriptions</a>
               <a href="{{ url_for('settings_page') }}">Settings</a>
               <a href="{{ url_for('logs_page') }}">Logs</a>
             <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
@@ -849,16 +1387,7 @@ def login_post():
     username = request.form.get("username", "")
     password = request.form.get("password", "")
 
-    password_ok = False
-    if ADMIN_PASSWORD_HASH:
-        try:
-            password_ok = check_password_hash(ADMIN_PASSWORD_HASH, password)
-        except (ValueError, TypeError):
-            password_ok = False
-    elif ADMIN_PASS:
-        password_ok = hmac.compare_digest(password, ADMIN_PASS)
-
-    if hmac.compare_digest(username, ADMIN_USER) and password_ok:
+    if hmac.compare_digest(username, ADMIN_USER) and hmac.compare_digest(password, ADMIN_PASS):
         session.clear()
         session.permanent = True
         session["admin"] = True
@@ -1193,129 +1722,6 @@ def delete_device(device_id):
     return redirect(url_for("devices_page"))
 
 
-@app.get("/security")
-@admin_required
-def security_page():
-    with db() as c:
-        rows = c.execute("""
-            SELECT * FROM security_blocks
-            WHERE active=1 AND expires_at>?
-            ORDER BY id DESC LIMIT 300
-        """, (iso(now_utc()),)).fetchall()
-        recent_limits = c.execute("""
-            SELECT bucket, client_ip, COUNT(*) AS hits, MAX(created_at) AS last_hit
-            FROM rate_limit_events
-            WHERE created_at>=?
-            GROUP BY bucket, client_ip
-            ORDER BY hits DESC LIMIT 30
-        """, (time.time() - 3600,)).fetchall()
-
-    body = """
-    <h1>Security Center</h1>
-    <div class="card">
-      <h2>Temporary block</h2>
-      <p class="small">Block an IP address or device ID. Use a short duration and a clear reason.</p>
-      <form method="post" action="{{ url_for('security_block_create') }}">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <div class="row">
-          <div><label>Type</label>
-            <select name="block_type" required>
-              <option value="ip">IP address</option>
-              <option value="hwid">Device HWID</option>
-            </select>
-          </div>
-          <div><label>Duration (minutes)</label>
-            <input type="number" name="duration" min="1" max="43200" value="60" required>
-          </div>
-        </div>
-        <label>IP / HWID</label>
-        <input name="subject" maxlength="256" required>
-        <label>Reason</label>
-        <input name="reason" maxlength="250" placeholder="Repeated failed login attempts">
-        <button class="btn danger" type="submit">Create temporary block</button>
-      </form>
-    </div>
-    <div class="card">
-      <h2>Active blocks</h2>
-      <table>
-        <tr><th>Type</th><th>Subject</th><th>Reason</th><th>Created</th><th>Expires</th><th>Action</th></tr>
-        {% for r in rows %}
-        <tr>
-          <td>{{ r['block_type'] }}</td><td><code>{{ r['subject'] }}</code></td>
-          <td>{{ r['reason'] }}</td><td>{{ r['created_at'] }}</td><td>{{ r['expires_at'] }}</td>
-          <td><form method="post" action="{{ url_for('security_block_remove', block_id=r['id']) }}">
-            <input type="hidden" name="csrf" value="{{ csrf }}">
-            <button class="btn primary">Unblock</button>
-          </form></td>
-        </tr>
-        {% else %}
-        <tr><td colspan="6" class="small">No active blocks.</td></tr>
-        {% endfor %}
-      </table>
-    </div>
-    <div class="card">
-      <h2>Rate-limit activity (last hour)</h2>
-      <table>
-        <tr><th>Bucket</th><th>IP</th><th>Hits</th><th>Last hit (UTC epoch)</th></tr>
-        {% for r in recent_limits %}
-        <tr><td>{{ r['bucket'] }}</td><td>{{ r['client_ip'] }}</td><td>{{ r['hits'] }}</td><td>{{ r['last_hit'] }}</td></tr>
-        {% else %}
-        <tr><td colspan="4" class="small">No recent rate-limit events.</td></tr>
-        {% endfor %}
-      </table>
-    </div>
-    """
-    return page("Security", render_template_string(
-        body, rows=rows, recent_limits=recent_limits, csrf=csrf_token()
-    ))
-
-
-@app.post("/security/blocks")
-@admin_required
-def security_block_create():
-    require_csrf()
-    block_type = request.form.get("block_type", "").strip()
-    subject = request.form.get("subject", "").strip()
-    reason = request.form.get("reason", "").strip()[:250]
-    try:
-        duration = int(request.form.get("duration", "60"))
-    except (TypeError, ValueError):
-        abort(400, "Invalid block duration")
-
-    if block_type not in ("ip", "hwid") or not subject or len(subject) > 256:
-        abort(400, "Invalid block target")
-    if duration < 1 or duration > 43200:
-        abort(400, "Block duration must be between 1 and 43200 minutes")
-
-    created = now_utc()
-    expires = created + timedelta(minutes=duration)
-    with db() as c:
-        c.execute("""
-            INSERT INTO security_blocks
-            (block_type,subject,reason,created_at,expires_at,created_by,active)
-            VALUES(?,?,?,?,?,?,1)
-        """, (block_type, subject, reason, iso(created), iso(expires), ADMIN_USER))
-        if block_type == "hwid":
-            c.execute(
-                "UPDATE api_sessions SET revoked=1 WHERE hwid=? AND revoked=0",
-                (subject,)
-            )
-
-    audit("SECURITY_BLOCK_CREATED",
-          f"type={block_type} subject={subject[:32]} duration={duration}m reason={reason}")
-    return redirect(url_for("security_page"))
-
-
-@app.post("/security/blocks/<int:block_id>/remove")
-@admin_required
-def security_block_remove(block_id):
-    require_csrf()
-    with db() as c:
-        c.execute("UPDATE security_blocks SET active=0 WHERE id=?", (block_id,))
-    audit("SECURITY_BLOCK_REMOVED", f"block_id={block_id}")
-    return redirect(url_for("security_page"))
-
-
 @app.get("/features")
 @admin_required
 def features_page():
@@ -1392,6 +1798,96 @@ def feature_update(feature_id):
     return redirect(url_for("features_page"))
 
 
+@app.get("/telegram-subscriptions")
+@admin_required
+def telegram_subscriptions_page():
+    with db() as c:
+        requests_rows = c.execute("""
+            SELECT r.*, u.username, u.first_name, u.last_name
+            FROM subscription_requests r LEFT JOIN telegram_users u ON u.telegram_id=r.telegram_id
+            ORDER BY r.id DESC LIMIT 200
+        """).fetchall()
+        subs_rows = c.execute("""
+            SELECT s.*, u.username, u.first_name, k.key,
+                   (SELECT COUNT(*) FROM devices d WHERE d.key_id=s.key_id) AS device_count
+            FROM subscriptions s LEFT JOIN telegram_users u ON u.telegram_id=s.telegram_id
+            JOIN keys k ON k.id=s.key_id ORDER BY s.id DESC LIMIT 200
+        """).fetchall()
+    body = """
+    <h1>اشتراكات تيليجرام</h1>
+    <div class="card">
+      <h2>إعداد البوت</h2>
+      <p class="small">ضع TELEGRAM_BOT_TOKEN و TELEGRAM_ADMIN_ID و TELEGRAM_POLLING=1 في متغيرات الاستضافة. لا تضع رمز البوت هنا أو داخل تطبيق أندرويد.</p>
+      <p>Bot status: <b class="{{ 'ok' if bot_ready else 'bad' }}">{{ 'جاهز' if bot_ready else 'متغيرات الإعداد ناقصة' }}</b></p>
+      <form method="post" action="{{ url_for('telegram_settings_save') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>ملاحظة إضافية تظهر للمستخدم (اختياري)</label>
+        <textarea name="payment_instructions" rows="3">{{ payment_instructions }}</textarea>
+        <label>عدد الأجهزة الافتراضي للاشتراكات الجديدة</label>
+        <input type="number" name="device_limit" min="1" max="100" value="{{ device_limit }}">
+        <button class="btn primary">حفظ إعدادات تيليجرام</button>
+      </form>
+    </div>
+    <div class="card"><h2>طلبات الاشتراك</h2><table>
+      <tr><th>الطلب</th><th>المستخدم</th><th>الخطة</th><th>الحالة</th><th>الإثبات</th><th>التاريخ</th><th>الإجراء</th></tr>
+      {% for r in requests_rows %}<tr>
+        <td>#{{ r['id'] }}</td><td>{{ r['first_name'] or '' }} @{{ r['username'] or 'no_username' }}<br><span class="small">{{ r['telegram_id'] }}</span></td>
+        <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td>{{ {'pending':'قيد المراجعة','approved':'مقبول','rejected':'مرفوض'}.get(r['status'],r['status']) }}</td><td>{{ 'تم استلام صورة' if (r['payment_proof'] or '').startswith('photo_file_id:') else 'بانتظار الصورة' }}</td><td>{{ r['created_at'] }}</td><td>
+        {% if r['status']=='pending' %}
+          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='approve') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">موافقة</button></form>
+          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='reject') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn danger">رفض</button></form>
+        {% else %}-{% endif %}</td></tr>{% endfor %}
+    </table></div>
+    <div class="card"><h2>المشتركون</h2><table>
+      <tr><th>المستخدم</th><th>الخطة</th><th>المفتاح</th><th>الأجهزة</th><th>الانتهاء</th><th>الحالة</th></tr>
+      {% for r in subs_rows %}<tr><td>{{ r['first_name'] or '' }} @{{ r['username'] or 'no_username' }}<br><span class="small">{{ r['telegram_id'] }}</span></td>
+      <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td><code>{{ r['key'] }}</code></td><td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td><td>{{ r['expires_at'] or 'Lifetime' }}</td><td>{{ 'Active' if r['active'] else 'Disabled' }}</td></tr>{% endfor %}
+    </table></div>
+    """
+    return page("Telegram Subscriptions", render_template_string(body, requests_rows=requests_rows,
+        subs_rows=subs_rows, plan_labels=PLAN_LABELS, csrf=csrf_token(),
+        bot_ready=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID),
+        payment_instructions=get_setting("payment_instructions", ""),
+        device_limit=get_setting("telegram_device_limit", "1")))
+
+
+@app.post("/telegram-subscriptions/settings")
+@admin_required
+def telegram_settings_save():
+    require_csrf()
+    try:
+        limit = max(1, min(100, int(request.form.get("device_limit", "1"))))
+    except ValueError:
+        abort(400, "Invalid device limit")
+    set_setting("telegram_device_limit", limit)
+    set_setting("payment_instructions", request.form.get("payment_instructions", "")[:2000])
+    audit("TELEGRAM_SETTINGS_UPDATED", f"device_limit={limit}")
+    return redirect(url_for("telegram_subscriptions_page"))
+
+
+@app.post("/telegram-subscriptions/<int:request_id>/<action>")
+@admin_required
+def telegram_request_action(request_id, action):
+    require_csrf()
+    if action == "approve":
+        ok, result = approve_subscription_request(request_id, "web-panel")
+        if ok and TELEGRAM_BOT_TOKEN:
+            try:
+                bot_send(result["telegram_id"], "تمت الموافقة على اشتراكك! افتح التطبيق وأنشئ رمز ربط مؤقت، ثم أرسل الرمز هنا لربط حسابك.")
+            except Exception as exc:
+                audit("TELEGRAM_NOTIFY_ERROR", str(exc)[:500])
+    elif action == "reject":
+        ok, target = reject_subscription_request(request_id, "web-panel")
+        if ok and target and TELEGRAM_BOT_TOKEN:
+            try:
+                bot_send(target, f"لم تتم الموافقة على طلب الاشتراك رقم #{request_id}.")
+            except Exception as exc:
+                audit("TELEGRAM_NOTIFY_ERROR", str(exc)[:500])
+    else:
+        abort(404)
+    return redirect(url_for("telegram_subscriptions_page"))
+
+
 @app.get("/settings")
 @admin_required
 def settings_page():
@@ -1410,4 +1906,293 @@ def settings_page():
         <select name="maintenance">
           <option value="0" {{ 'selected' if not maintenance else '' }}>OFF</option>
           <option value="1" {{ 'selected' if maintenance else '' }}>ON</option>
-        <
+        </select>
+
+        <label>Menu Version</label>
+        <input name="menu_version" value="{{ version }}">
+
+        <label>Minimum Client Version</label>
+        <input name="min_client_version" value="{{ minver }}">
+
+        <label>Announcement</label>
+        <textarea name="announcement" rows="4">{{ announcement }}</textarea>
+
+        <button class="btn primary">Save Settings</button>
+      </form>
+    </div>
+    """
+    return page("Settings", render_template_string(
+        body,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        maintenance=get_setting("maintenance") == "1",
+        version=get_setting("menu_version", "1.0.0"),
+        minver=get_setting("min_client_version", "1.0.0"),
+        announcement=get_setting("announcement", ""),
+        csrf=csrf_token()
+    ))
+
+
+@app.post("/settings")
+@admin_required
+def settings_save():
+    require_csrf()
+
+    set_setting("menu_enabled", "1" if request.form.get("menu_enabled") == "1" else "0")
+    set_setting("maintenance", "1" if request.form.get("maintenance") == "1" else "0")
+    set_setting("menu_version", request.form.get("menu_version", "1.0.0")[:50])
+    set_setting("min_client_version", request.form.get("min_client_version", "1.0.0")[:50])
+    set_setting("announcement", request.form.get("announcement", "")[:2000])
+
+    # Kill switch: immediately revoke all sessions.
+    if get_setting("menu_enabled") != "1" or get_setting("maintenance") == "1":
+        with db() as c:
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE revoked=0")
+
+    audit("SETTINGS_UPDATED", "server settings changed")
+    return redirect(url_for("settings_page"))
+
+
+@app.get("/security")
+@admin_required
+def security_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM security_blocks
+            ORDER BY active DESC, id DESC
+            LIMIT 500
+        """).fetchall()
+
+    body = """
+    <h1>Security</h1>
+    <div class="card">
+      <h2>Block an IP or device</h2>
+      <form method="post" action="{{ url_for('security_block') }}" class="form-grid">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>Type
+          <select name="block_type">
+            <option value="ip">IP address</option>
+            <option value="hwid">Device HWID</option>
+          </select>
+        </label>
+        <label>IP / HWID
+          <input name="subject" maxlength="180" required placeholder="Enter exact IP or HWID">
+        </label>
+        <label>Reason
+          <input name="reason" maxlength="300" placeholder="Optional reason">
+        </label>
+        <label>Duration
+          <select name="duration">
+            <option value="0">Permanent until unblocked</option>
+            <option value="1">1 hour</option>
+            <option value="24">24 hours</option>
+            <option value="168">7 days</option>
+          </select>
+        </label>
+        <button class="btn danger" type="submit">Apply Block</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Current and previous blocks</h2>
+      <div class="table-scroll">
+      <table>
+        <tr><th>Type</th><th>IP / HWID</th><th>Reason</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['block_type'] }}</td>
+          <td><code>{{ r['subject'] }}</code></td>
+          <td>{{ r['reason'] }}</td>
+          <td>{{ r['created_at'] }}</td>
+          <td>{{ r['expires_at'] or 'Permanent' }}</td>
+          <td>{% if r['active'] %}<span class="bad">Active</span>{% else %}<span class="ok">Inactive</span>{% endif %}</td>
+          <td>
+            {% if r['active'] %}
+            <form method="post" action="{{ url_for('security_unblock', block_id=r['id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn" type="submit">Unblock</button>
+            </form>
+            {% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+      </div>
+    </div>
+    """
+    return page("Security", render_template_string(body, rows=rows, csrf=csrf_token()))
+
+
+@app.post("/security/block")
+@admin_required
+def security_block():
+    require_csrf()
+    block_type = (request.form.get("block_type") or "").strip().lower()
+    subject = (request.form.get("subject") or "").strip()
+    reason = (request.form.get("reason") or "").strip()[:300]
+    duration = (request.form.get("duration") or "0").strip()
+
+    if block_type not in ("ip", "hwid") or not subject or len(subject) > 180:
+        abort(400, "Invalid block details")
+    if any(ch in subject for ch in "\r\n\x00"):
+        abort(400, "Invalid subject")
+    if duration not in ("0", "1", "24", "168"):
+        abort(400, "Invalid duration")
+
+    expires_at = ""
+    if duration != "0":
+        expires_at = iso(now_utc() + timedelta(hours=int(duration)))
+
+    with db() as c:
+        c.execute("""
+            INSERT INTO security_blocks(block_type,subject,reason,created_at,expires_at,active)
+            VALUES(?,?,?,?,?,1)
+            ON CONFLICT(block_type,subject) DO UPDATE SET
+              reason=excluded.reason,
+              created_at=excluded.created_at,
+              expires_at=excluded.expires_at,
+              active=1
+        """, (block_type, subject, reason, iso(now_utc()), expires_at))
+        if block_type == "hwid":
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE hwid=? AND revoked=0", (subject,))
+    audit("SECURITY_BLOCK_ADDED", f"{block_type}:{subject[:120]}")
+    return redirect(url_for("security_page"))
+
+
+@app.post("/security/unblock/<int:block_id>")
+@admin_required
+def security_unblock(block_id):
+    require_csrf()
+    with db() as c:
+        c.execute("UPDATE security_blocks SET active=0 WHERE id=?", (block_id,))
+    audit("SECURITY_BLOCK_REMOVED", f"block_id={block_id}")
+    return redirect(url_for("security_page"))
+
+
+@app.get("/login-activity")
+@admin_required
+def login_activity_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT created_at,event,ip,details
+            FROM audit_logs
+            WHERE event IN (
+                'API_LOGIN_OK',
+                'API_LOGIN_FAILED',
+                'ADMIN_LOGIN',
+                'ADMIN_LOGIN_FAILED'
+            )
+            ORDER BY id DESC
+            LIMIT 500
+        """).fetchall()
+
+    body = """
+    <h1>Login Activity</h1>
+    <div class="card">
+      <p class="small">
+        Successful and failed login attempts with IP, masked key,
+        HWID prefix and client version.
+      </p>
+      <div class="table-scroll">
+      <table>
+        <tr><th>Time</th><th>Result</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>
+            {% if r['event'] in ['API_LOGIN_OK','ADMIN_LOGIN'] %}
+              <span class="ok">{{ r['event'] }}</span>
+            {% else %}
+              <span class="bad">{{ r['event'] }}</span>
+            {% endif %}
+          </td>
+          <td><code>{{ r['ip'] or 'unknown' }}</code></td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      </div>
+    </div>
+    """
+    return page("Login Activity", render_template_string(body, rows=rows))
+
+
+@app.get("/logs")
+@admin_required
+def logs_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM audit_logs
+            ORDER BY id DESC LIMIT 300
+        """).fetchall()
+
+    body = """
+    <h1>Audit Logs</h1>
+    <div class="card">
+      <table>
+        <tr><th>Time</th><th>Event</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>{{ r['event'] }}</td>
+          <td>{{ r['ip'] }}</td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("Logs", render_template_string(body, rows=rows, csrf=csrf_token()))
+
+
+# ============================================================
+# SECURITY HEADERS / ERROR RESPONSES
+# ============================================================
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https://media.tenor.com;"
+    )
+    return response
+
+
+@app.errorhandler(400)
+def bad_request(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": str(e)}), 400
+    message = str(e)
+    if "Invalid CSRF token" in message:
+        return render_template_string(BASE_STYLE + """
+        <div class="wrap login-shell"><div class="card login-card">
+          <h1>Session expired</h1>
+          <p class="small">The security token for this page is no longer valid. Reload the panel and try again.</p>
+          <a class="btn primary" href="{{ url_for('keys_page') }}">Reload Keys</a>
+        </div></div>
+        """), 400
+    return message, 400
+
+
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return "Not found", 404
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+init_db()
+
+if __name__ == "__main__":
+    start_telegram_polling()
+    port = int(os.environ.get("PORT", "8080"))
+    # Host must be 0.0.0.0 for Railway/Render/etc.
+    app.run(host="0.0.0.0", port=port, debug=False)
