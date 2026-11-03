@@ -1,3 +1,4 @@
+
 import os
 import json
 import sqlite3
@@ -8,10 +9,14 @@ import time
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from urllib.parse import urlparse
+from urllib.request import Request as URLRequest, urlopen
+from urllib.error import URLError, HTTPError
+import threading
+from io import BytesIO
 
 from flask import (
     Flask, request, jsonify, session, redirect,
-    url_for, render_template_string, abort, make_response
+    url_for, render_template_string, abort, make_response, send_file
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -31,6 +36,9 @@ from werkzeug.security import generate_password_hash, check_password_hash
 #   DB_PATH=modpanel.db
 #   SESSION_HOURS=12
 #   API_SESSION_MINUTES=30
+#   TELEGRAM_BOT_TOKEN=...
+#   TELEGRAM_ADMIN_ID=123456789
+#   TELEGRAM_POLLING=1  (single server instance)
 #
 # IMPORTANT:
 # - The server is the source of truth for keys/expiry/permissions.
@@ -41,8 +49,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011")
-SECRET_KEY = os.environ.get("SECRET_KEY", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
 
 if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
     raise RuntimeError(
@@ -69,6 +77,14 @@ app.config.update(
 
 DB_PATH = os.environ.get("DB_PATH", "modpanel.db")
 API_SESSION_MINUTES = int(os.environ.get("API_SESSION_MINUTES", "30"))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc").strip()
+TELEGRAM_ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "8299101176").strip()
+TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "MoldesKeysBot").strip().lstrip("@")
+TELEGRAM_BOT_NAME = os.environ.get("TELEGRAM_BOT_NAME", "Key EX25").strip()
+TELEGRAM_POLLING = os.environ.get("TELEGRAM_POLLING", "0") == "1"
+BOT_POLL_OFFSET = 0
+BOT_THREAD_STARTED = False
+BOT_THREAD_LOCK = threading.Lock()
 
 # Small in-memory rate limiter. For a single private server this is useful.
 # If you later run multiple workers/instances, move rate limiting to Redis.
@@ -179,6 +195,58 @@ def init_db():
             FOREIGN KEY(feature_id) REFERENCES feature_permissions(feature_id) ON DELETE CASCADE
         );
         """)
+
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS telegram_users (
+            telegram_id INTEGER PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            last_name TEXT DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS subscription_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            payment_proof TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT DEFAULT '',
+            admin_note TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            request_id INTEGER NOT NULL UNIQUE,
+            telegram_id INTEGER NOT NULL,
+            key_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
+            starts_at TEXT NOT NULL,
+            expires_at TEXT,
+            device_limit INTEGER NOT NULL DEFAULT 1,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(request_id) REFERENCES subscription_requests(id),
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS telegram_link_codes (
+            code_hash TEXT PRIMARY KEY,
+            hwid TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            telegram_id INTEGER,
+            linked_at TEXT DEFAULT '',
+            used_at TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_subscriptions_telegram
+            ON subscriptions(telegram_id, active);
+        CREATE INDEX IF NOT EXISTS idx_requests_status
+            ON subscription_requests(status, created_at);
+        """)
+
+        # Safe additive migration for databases created by earlier versions.
+        user_columns = {row["name"] for row in c.execute("PRAGMA table_info(telegram_users)").fetchall()}
+        if "photo_file_id" not in user_columns:
+            c.execute("ALTER TABLE telegram_users ADD COLUMN photo_file_id TEXT DEFAULT ''")
 
         defaults = {
             "menu_enabled": "1",
@@ -692,6 +760,368 @@ def api_logout():
 
 
 # ============================================================
+# TELEGRAM SUBSCRIPTIONS
+# ============================================================
+
+PLAN_DAYS = {"week": 7, "month": 30, "year": 365, "lifetime": 0}
+PLAN_LABELS = {"week": "Week", "month": "Month", "year": "Year", "lifetime": "Lifetime"}
+
+
+def telegram_api(method, payload=None):
+    if not TELEGRAM_BOT_TOKEN:
+        raise RuntimeError("Telegram bot is not configured")
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = URLRequest(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with urlopen(req, timeout=40) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if not result.get("ok"):
+        raise RuntimeError(result.get("description", "Telegram API error"))
+    return result.get("result")
+
+
+def bot_send(chat_id, text, reply_markup=None):
+    payload = {"chat_id": int(chat_id), "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return telegram_api("sendMessage", payload)
+
+
+def save_telegram_user(user):
+    tid = int(user.get("id"))
+    with db() as c:
+        c.execute("""
+            INSERT INTO telegram_users(telegram_id,username,first_name,last_name,updated_at)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+              username=excluded.username, first_name=excluded.first_name,
+              last_name=excluded.last_name, updated_at=excluded.updated_at
+        """, (tid, user.get("username", ""), user.get("first_name", ""),
+              user.get("last_name", ""), iso(now_utc())))
+
+
+def refresh_telegram_photo(telegram_id):
+    """Store the largest available profile-photo file_id; the bot token stays server-side."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        result = telegram_api("getUserProfilePhotos", {"user_id": int(telegram_id), "offset": 0, "limit": 1})
+        photos = result.get("photos") or []
+        file_id = photos[0][-1].get("file_id", "") if photos and photos[0] else ""
+        with db() as c:
+            c.execute("UPDATE telegram_users SET photo_file_id=? WHERE telegram_id=?", (file_id, int(telegram_id)))
+    except Exception as exc:
+        audit("TELEGRAM_PHOTO_ERROR", str(exc)[:300])
+
+
+def active_subscription(telegram_id):
+    with db() as c:
+        rows = c.execute("""
+            SELECT s.*, k.active AS key_active, k.expires_at AS key_expires_at
+            FROM subscriptions s JOIN keys k ON k.id=s.key_id
+            WHERE s.telegram_id=? AND s.active=1
+            ORDER BY s.id DESC
+        """, (int(telegram_id),)).fetchall()
+    for row in rows:
+        exp = parse_iso(row["expires_at"])
+        if row["key_active"] and (not exp or exp > now_utc()):
+            return row
+    return None
+
+
+def approve_subscription_request(request_id, reviewer="admin"):
+    with db() as c:
+        req = c.execute("SELECT * FROM subscription_requests WHERE id=?", (request_id,)).fetchone()
+        if not req:
+            return False, "Request not found"
+        if req["status"] != "pending":
+            return False, "Request is already reviewed"
+        days = PLAN_DAYS.get(req["plan"])
+        if days is None:
+            return False, "Invalid plan"
+        try:
+            device_limit = max(1, min(100, int(get_setting("telegram_device_limit", "1"))))
+        except ValueError:
+            device_limit = 1
+        key_value = generate_key()
+        created = now_utc()
+        expires = None if days == 0 else iso(created + timedelta(days=days))
+        note = f"Telegram:{req['telegram_id']} | Request:{request_id}"
+        cur = c.execute("""
+            INSERT INTO keys(key,active,device_limit,expires_at,created_at,note)
+            VALUES(?,1,?,?,?,?)
+        """, (key_value, device_limit, expires, iso(created), note))
+        key_id = cur.lastrowid
+        c.execute("""
+            INSERT INTO subscriptions(request_id,telegram_id,key_id,plan,starts_at,expires_at,device_limit,active,created_at)
+            VALUES(?,?,?,?,?,?,?,1,?)
+        """, (request_id, req["telegram_id"], key_id, req["plan"], iso(created), expires, device_limit, iso(created)))
+        c.execute("UPDATE subscription_requests SET status='approved', reviewed_at=? WHERE id=?",
+                  (iso(created), request_id))
+    audit("TELEGRAM_SUBSCRIPTION_APPROVED", f"request={request_id} telegram_id={req['telegram_id']} by={reviewer}")
+    return True, {"telegram_id": req["telegram_id"], "expires_at": expires, "device_limit": device_limit}
+
+
+def reject_subscription_request(request_id, reviewer="admin"):
+    with db() as c:
+        cur = c.execute("""
+            UPDATE subscription_requests SET status='rejected', reviewed_at=?
+            WHERE id=? AND status='pending'
+        """, (iso(now_utc()), request_id))
+        changed = cur.rowcount
+        row = c.execute("SELECT telegram_id FROM subscription_requests WHERE id=?", (request_id,)).fetchone()
+    if changed:
+        audit("TELEGRAM_SUBSCRIPTION_REJECTED", f"request={request_id} by={reviewer}")
+        return True, row["telegram_id"] if row else None
+    return False, None
+
+
+def bot_handle_update(update):
+    message = update.get("message") or update.get("edited_message")
+    callback = update.get("callback_query")
+    if callback:
+        user = callback.get("from", {})
+        save_telegram_user(user)
+        refresh_telegram_photo(user.get("id"))
+        data = callback.get("data", "")
+        callback_id = callback.get("id")
+        if data.startswith("plan:"):
+            plan = data.split(":", 1)[1]
+            if plan not in PLAN_DAYS:
+                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Invalid plan"})
+                return
+            with db() as c:
+                cur = c.execute("""
+                    INSERT INTO subscription_requests(telegram_id,plan,status,created_at)
+                    VALUES(?,?,'pending',?)
+                """, (int(user["id"]), plan, iso(now_utc())))
+                request_id = cur.lastrowid
+            telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Request created"})
+            instructions = get_setting("payment_instructions", "Please send your payment proof or transaction reference in this chat.")
+            bot_send(user["id"], f"Your {PLAN_LABELS[plan]} subscription request #{request_id} has been created.\n\n{instructions}\n\nAfter sending proof, wait for admin approval.")
+            if TELEGRAM_ADMIN_ID:
+                proof_text = f"New subscription request #{request_id}\nUser: {user.get('first_name','')} (@{user.get('username','')})\nTelegram ID: {user['id']}\nPlan: {PLAN_LABELS[plan]}\nWaiting for payment proof; approval buttons will be sent after proof arrives."
+                bot_send(TELEGRAM_ADMIN_ID, proof_text)
+            return
+        if data.startswith("req:"):
+            if not TELEGRAM_ADMIN_ID or str(user.get("id")) != TELEGRAM_ADMIN_ID:
+                telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Not authorized", "show_alert": True})
+                return
+            _, action, raw_id = data.split(":", 2)
+            try:
+                request_id = int(raw_id)
+            except ValueError:
+                return
+            if action == "approve":
+                ok, result = approve_subscription_request(request_id, str(user.get("id")))
+                if ok:
+                    expiry = result["expires_at"] or "Never"
+                    bot_send(result["telegram_id"], f"Your subscription is approved!\nPlan activated. Expiration: {expiry}\n\nOpen the app, generate a temporary link code, then send that code here to connect your account.")
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Approved"})
+                    bot_send(user["id"], f"Request #{request_id} approved. Device limit: {result['device_limit']}.")
+                else:
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": str(result), "show_alert": True})
+            elif action == "reject":
+                ok, target = reject_subscription_request(request_id, str(user.get("id")))
+                if ok and target:
+                    bot_send(target, f"Your subscription request #{request_id} was not approved. Contact the administrator if you think this is a mistake.")
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Rejected"})
+                else:
+                    telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "Request already reviewed", "show_alert": True})
+            return
+    if not message:
+        return
+    user = message.get("from", {})
+    chat_id = message.get("chat", {}).get("id")
+    if not user or not chat_id:
+        return
+    save_telegram_user(user)
+    refresh_telegram_photo(user.get("id"))
+    text_value = (message.get("text") or "").strip()
+    if text_value.startswith("/start"):
+        markup = {"inline_keyboard": [
+            [{"text": "1 Week", "callback_data": "plan:week"}, {"text": "1 Month", "callback_data": "plan:month"}],
+            [{"text": "1 Year", "callback_data": "plan:year"}, {"text": "Lifetime", "callback_data": "plan:lifetime"}]
+        ]}
+        bot_send(chat_id, "Welcome! Choose your subscription plan:", markup)
+        return
+    # A payment proof can be text, a transaction reference, or a Telegram photo.
+    proof = text_value
+    if message.get("photo"):
+        proof = "photo_file_id:" + message["photo"][-1].get("file_id", "")
+    if proof:
+        with db() as c:
+            req = c.execute("""
+                SELECT * FROM subscription_requests
+                WHERE telegram_id=? AND status='pending'
+                ORDER BY id DESC LIMIT 1
+            """, (int(user["id"]),)).fetchone()
+            if req:
+                c.execute("UPDATE subscription_requests SET payment_proof=? WHERE id=?", (proof[:1500], req["id"]))
+        if req:
+            bot_send(chat_id, "Payment proof received. Please wait for manual admin review.")
+            if TELEGRAM_ADMIN_ID:
+                preview = proof[:500] if not proof.startswith("photo_file_id:") else "Photo proof attached in the user's chat."
+                markup = {"inline_keyboard": [[
+                    {"text": "Approve", "callback_data": f"req:approve:{req['id']}"},
+                    {"text": "Reject", "callback_data": f"req:reject:{req['id']}"}
+                ]]}
+                bot_send(TELEGRAM_ADMIN_ID, f"Payment proof for request #{req['id']}\nTelegram ID: {user['id']}\nPlan: {PLAN_LABELS.get(req['plan'], req['plan'])}\nProof: {preview}", markup)
+            return
+    # Link codes are short, one-time codes generated by the app.
+    if text_value and len(text_value) <= 32 and text_value.replace("-", "").isalnum():
+        digest = hash_token(text_value.upper())
+        with db() as c:
+            link = c.execute("SELECT * FROM telegram_link_codes WHERE code_hash=?", (digest,)).fetchone()
+            sub = active_subscription(user["id"])
+            if link and not link["used_at"] and parse_iso(link["expires_at"]) and parse_iso(link["expires_at"]) > now_utc() and sub:
+                c.execute("UPDATE telegram_link_codes SET telegram_id=?,linked_at=? WHERE code_hash=? AND telegram_id IS NULL",
+                          (int(user["id"]), iso(now_utc()), digest))
+                linked = c.execute("SELECT changes() n").fetchone()["n"] == 1
+            else:
+                linked = False
+        if linked:
+            bot_send(chat_id, "Account linked successfully! Return to the app; it will finish signing you in.")
+        else:
+            bot_send(chat_id, "Code not accepted. Check that your subscription is approved and the code is still valid.")
+
+
+def telegram_poll_loop():
+    global BOT_POLL_OFFSET
+    while True:
+        try:
+            updates = telegram_api("getUpdates", {"offset": BOT_POLL_OFFSET, "timeout": 25, "allowed_updates": ["message", "callback_query"]})
+            for item in updates or []:
+                BOT_POLL_OFFSET = max(BOT_POLL_OFFSET, int(item.get("update_id", 0)) + 1)
+                try:
+                    bot_handle_update(item)
+                except Exception as exc:
+                    audit("TELEGRAM_UPDATE_ERROR", str(exc)[:500])
+        except Exception as exc:
+            audit("TELEGRAM_POLL_ERROR", str(exc)[:500])
+            time.sleep(5)
+
+
+def start_telegram_polling():
+    global BOT_THREAD_STARTED
+    if not TELEGRAM_POLLING or not TELEGRAM_BOT_TOKEN or not TELEGRAM_ADMIN_ID:
+        return
+    with BOT_THREAD_LOCK:
+        if BOT_THREAD_STARTED:
+            return
+        thread = threading.Thread(target=telegram_poll_loop, daemon=True, name="telegram-polling")
+        thread.start()
+        BOT_THREAD_STARTED = True
+
+
+@app.post("/api/v1/telegram/link-code")
+def api_create_telegram_link_code():
+    if not rate_limit("telegram_link_code", 8, 60):
+        return jsonify({"success": False, "message": "Too many attempts"}), 429
+    data = request.get_json(silent=True) or {}
+    hwid = str(data.get("hwid", "")).strip()
+    if not hwid or len(hwid) > 256:
+        return jsonify({"success": False, "message": "Invalid device id"}), 400
+    code = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(8))
+    created = now_utc()
+    expires = created + timedelta(minutes=5)
+    with db() as c:
+        c.execute("DELETE FROM telegram_link_codes WHERE expires_at<? OR used_at!=''", (iso(created),))
+        c.execute("INSERT INTO telegram_link_codes(code_hash,hwid,created_at,expires_at) VALUES(?,?,?,?)",
+                  (hash_token(code), hwid, iso(created), iso(expires)))
+    return jsonify({"success": True, "link_code": code, "expires_at": iso(expires), "bot_username": TELEGRAM_BOT_USERNAME})
+
+
+@app.get("/api/v1/telegram/avatar/<int:telegram_id>")
+def api_telegram_avatar(telegram_id):
+    if not TELEGRAM_BOT_TOKEN:
+        abort(404)
+    sub = active_subscription(telegram_id)
+    if not sub:
+        abort(404)
+    with db() as c:
+        row = c.execute("SELECT photo_file_id FROM telegram_users WHERE telegram_id=?", (telegram_id,)).fetchone()
+    if not row or not row["photo_file_id"]:
+        abort(404)
+    try:
+        file_info = telegram_api("getFile", {"file_id": row["photo_file_id"]})
+        file_path = file_info.get("file_path")
+        if not file_path:
+            abort(404)
+        url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+        with urlopen(url, timeout=15) as response:
+            content = response.read(2 * 1024 * 1024 + 1)
+        if len(content) > 2 * 1024 * 1024:
+            abort(413)
+        return send_file(BytesIO(content), mimetype="image/jpeg", max_age=300)
+    except (URLError, HTTPError, RuntimeError):
+        abort(404)
+
+
+@app.post("/api/v1/telegram/login")
+def api_telegram_login():
+    if not rate_limit("telegram_login", 12, 60):
+        return jsonify({"success": False, "message": "Too many attempts"}), 429
+    data = request.get_json(silent=True) or {}
+    code = str(data.get("link_code", "")).strip().upper()
+    hwid = str(data.get("hwid", "")).strip()
+    if not code or not hwid or len(hwid) > 256:
+        return jsonify({"success": False, "message": "Missing link code or device id"}), 400
+    digest = hash_token(code)
+    with db() as c:
+        link = c.execute("SELECT * FROM telegram_link_codes WHERE code_hash=? AND hwid=?", (digest, hwid)).fetchone()
+        if not link or not link["telegram_id"] or link["used_at"] or not parse_iso(link["expires_at"]) or parse_iso(link["expires_at"]) <= now_utc():
+            return jsonify({"success": False, "message": "Code is not linked or has expired"}), 403
+        telegram_id = int(link["telegram_id"])
+        sub = c.execute("""
+            SELECT s.id AS subscription_id, s.key_id, s.device_limit,
+                   s.expires_at AS subscription_expires_at, s.active AS subscription_active,
+                   k.active AS key_active, k.expires_at AS key_expires_at
+            FROM subscriptions s JOIN keys k ON k.id=s.key_id
+            WHERE s.telegram_id=? AND s.active=1
+            ORDER BY s.id DESC LIMIT 1
+        """, (telegram_id,)).fetchone()
+        if not sub or not sub["subscription_active"] or not sub["key_active"]:
+            return jsonify({"success": False, "message": "No active subscription"}), 403
+        if sub["subscription_expires_at"] and parse_iso(sub["subscription_expires_at"]) <= now_utc():
+            return jsonify({"success": False, "message": "Subscription expired"}), 403
+        if sub["key_expires_at"] and parse_iso(sub["key_expires_at"]) <= now_utc():
+            return jsonify({"success": False, "message": "Subscription expired"}), 403
+        key_id = sub["key_id"]
+        device = c.execute("SELECT * FROM devices WHERE key_id=? AND hwid=?", (key_id, hwid)).fetchone()
+        count = c.execute("SELECT COUNT(*) n FROM devices WHERE key_id=?", (key_id,)).fetchone()["n"]
+        if not device and count >= sub["device_limit"]:
+            return jsonify({"success": False, "message": "Device limit reached"}), 403
+        now_text = iso(now_utc())
+        if device:
+            c.execute("UPDATE devices SET last_seen=? WHERE id=?", (now_text, device["id"]))
+        else:
+            c.execute("INSERT INTO devices(key_id,hwid,first_seen,last_seen,label) VALUES(?,?,?,?,?)",
+                      (key_id, hwid, now_text, now_text, f"Telegram:{telegram_id}"))
+        c.execute("UPDATE telegram_link_codes SET used_at=? WHERE code_hash=?", (now_text, digest))
+        token = secrets.token_urlsafe(48)
+        expires = now_utc() + timedelta(minutes=API_SESSION_MINUTES)
+        c.execute("INSERT INTO api_sessions(token_hash,key_id,hwid,created_at,expires_at,last_seen) VALUES(?,?,?,?,?,?)",
+                  (hash_token(token), key_id, hwid, now_text, iso(expires), now_text))
+        profile = c.execute("SELECT username,first_name,last_name FROM telegram_users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        key_row = c.execute("SELECT * FROM keys WHERE id=?", (key_id,)).fetchone()
+    menu = menu_payload(key_row)
+    if not menu["menu_enabled"] or menu["maintenance"]:
+        with db() as c:
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE token_hash=?", (hash_token(token),))
+        return jsonify({"success": False, "message": "MOD MENU unavailable"}), 503
+    audit("TELEGRAM_LOGIN_OK", f"telegram_id={telegram_id} hwid={hwid[:16]}...")
+    return jsonify({"success": True, "session_token": token, "session_expires_at": iso(expires),
+                    "key_expires_at": key_row["expires_at"], "telegram": {"id": telegram_id,
+                    "username": profile["username"] if profile else "",
+                    "first_name": profile["first_name"] if profile else "",
+                    "last_name": profile["last_name"] if profile else "",
+                    "avatar_url": f"/api/v1/telegram/avatar/{telegram_id}"},
+                    "menu_version": menu["menu_version"], "min_client_version": menu["min_client_version"],
+                    "permissions": menu["permissions"], "announcement": menu["announcement"]})
+
+
+# ============================================================
 # ADMIN WEB PANEL
 # ============================================================
 
@@ -732,6 +1162,7 @@ def page(title, body):
               <a href="{{ url_for('keys_page') }}">Keys</a>
               <a href="{{ url_for('devices_page') }}">Devices</a>
               <a href="{{ url_for('features_page') }}">Permissions</a>
+              <a href="{{ url_for('telegram_subscriptions_page') }}">Telegram Subscriptions</a>
               <a href="{{ url_for('settings_page') }}">Settings</a>
               <a href="{{ url_for('logs_page') }}">Logs</a>
             <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
@@ -1197,6 +1628,96 @@ def feature_update(feature_id):
     return redirect(url_for("features_page"))
 
 
+@app.get("/telegram-subscriptions")
+@admin_required
+def telegram_subscriptions_page():
+    with db() as c:
+        requests_rows = c.execute("""
+            SELECT r.*, u.username, u.first_name, u.last_name
+            FROM subscription_requests r LEFT JOIN telegram_users u ON u.telegram_id=r.telegram_id
+            ORDER BY r.id DESC LIMIT 200
+        """).fetchall()
+        subs_rows = c.execute("""
+            SELECT s.*, u.username, u.first_name, k.key,
+                   (SELECT COUNT(*) FROM devices d WHERE d.key_id=s.key_id) AS device_count
+            FROM subscriptions s LEFT JOIN telegram_users u ON u.telegram_id=s.telegram_id
+            JOIN keys k ON k.id=s.key_id ORDER BY s.id DESC LIMIT 200
+        """).fetchall()
+    body = """
+    <h1>Telegram Subscriptions</h1>
+    <div class="card">
+      <h2>Bot setup</h2>
+      <p class="small">Set TELEGRAM_BOT_TOKEN, TELEGRAM_ADMIN_ID and TELEGRAM_POLLING=1 in your hosting environment. Never put the bot token in this page or inside the Android app.</p>
+      <p>Bot status: <b class="{{ 'ok' if bot_ready else 'bad' }}">{{ 'Configured' if bot_ready else 'Missing environment variables' }}</b></p>
+      <form method="post" action="{{ url_for('telegram_settings_save') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>Payment instructions shown by the bot</label>
+        <textarea name="payment_instructions" rows="3">{{ payment_instructions }}</textarea>
+        <label>Default device limit for new Telegram subscriptions</label>
+        <input type="number" name="device_limit" min="1" max="100" value="{{ device_limit }}">
+        <button class="btn primary">Save Telegram Settings</button>
+      </form>
+    </div>
+    <div class="card"><h2>Subscription Requests</h2><table>
+      <tr><th>ID</th><th>User</th><th>Plan</th><th>Status</th><th>Payment proof</th><th>Created</th><th>Actions</th></tr>
+      {% for r in requests_rows %}<tr>
+        <td>#{{ r['id'] }}</td><td>{{ r['first_name'] or '' }} @{{ r['username'] or 'no_username' }}<br><span class="small">{{ r['telegram_id'] }}</span></td>
+        <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td>{{ r['status'] }}</td><td>{{ r['payment_proof'] or '-' }}</td><td>{{ r['created_at'] }}</td><td>
+        {% if r['status']=='pending' %}
+          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='approve') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">Approve</button></form>
+          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='reject') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn danger">Reject</button></form>
+        {% else %}-{% endif %}</td></tr>{% endfor %}
+    </table></div>
+    <div class="card"><h2>Subscribers</h2><table>
+      <tr><th>User</th><th>Plan</th><th>Key</th><th>Devices</th><th>Expires</th><th>Status</th></tr>
+      {% for r in subs_rows %}<tr><td>{{ r['first_name'] or '' }} @{{ r['username'] or 'no_username' }}<br><span class="small">{{ r['telegram_id'] }}</span></td>
+      <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td><code>{{ r['key'] }}</code></td><td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td><td>{{ r['expires_at'] or 'Lifetime' }}</td><td>{{ 'Active' if r['active'] else 'Disabled' }}</td></tr>{% endfor %}
+    </table></div>
+    """
+    return page("Telegram Subscriptions", render_template_string(body, requests_rows=requests_rows,
+        subs_rows=subs_rows, plan_labels=PLAN_LABELS, csrf=csrf_token(),
+        bot_ready=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID),
+        payment_instructions=get_setting("payment_instructions", "Please send your payment proof or transaction reference in this chat."),
+        device_limit=get_setting("telegram_device_limit", "1")))
+
+
+@app.post("/telegram-subscriptions/settings")
+@admin_required
+def telegram_settings_save():
+    require_csrf()
+    try:
+        limit = max(1, min(100, int(request.form.get("device_limit", "1"))))
+    except ValueError:
+        abort(400, "Invalid device limit")
+    set_setting("telegram_device_limit", limit)
+    set_setting("payment_instructions", request.form.get("payment_instructions", "")[:2000])
+    audit("TELEGRAM_SETTINGS_UPDATED", f"device_limit={limit}")
+    return redirect(url_for("telegram_subscriptions_page"))
+
+
+@app.post("/telegram-subscriptions/<int:request_id>/<action>")
+@admin_required
+def telegram_request_action(request_id, action):
+    require_csrf()
+    if action == "approve":
+        ok, result = approve_subscription_request(request_id, "web-panel")
+        if ok and TELEGRAM_BOT_TOKEN:
+            try:
+                bot_send(result["telegram_id"], "Your subscription is approved! Open the app, generate a temporary link code, then send it here to connect your account.")
+            except Exception as exc:
+                audit("TELEGRAM_NOTIFY_ERROR", str(exc)[:500])
+    elif action == "reject":
+        ok, target = reject_subscription_request(request_id, "web-panel")
+        if ok and target and TELEGRAM_BOT_TOKEN:
+            try:
+                bot_send(target, f"Your subscription request #{request_id} was rejected.")
+            except Exception as exc:
+                audit("TELEGRAM_NOTIFY_ERROR", str(exc)[:500])
+    else:
+        abort(404)
+    return redirect(url_for("telegram_subscriptions_page"))
+
+
 @app.get("/settings")
 @admin_required
 def settings_page():
@@ -1386,6 +1907,7 @@ def not_found(e):
 init_db()
 
 if __name__ == "__main__":
+    start_telegram_polling()
     port = int(os.environ.get("PORT", "8080"))
     # Host must be 0.0.0.0 for Railway/Render/etc.
     app.run(host="0.0.0.0", port=port, debug=False)
