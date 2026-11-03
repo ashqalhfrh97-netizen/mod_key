@@ -31,6 +31,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 #   ADMIN_PASS=your_strong_admin_password
 #   SECRET_KEY=a_long_random_secret
 #   PORT=8080
+
 #
 # Optional:
 #   DB_PATH=modpanel.db
