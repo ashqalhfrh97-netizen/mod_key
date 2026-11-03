@@ -43,10 +43,10 @@ from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 
-ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011")
-ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1").strip()
-SECRET_KEY = os.environ.get("SECRET_KEY", "8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc")
+ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "")
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "")
 
 if not ADMIN_USER or not (ADMIN_PASS or ADMIN_PASSWORD_HASH) or len(SECRET_KEY) < 32:
     raise RuntimeError(
@@ -58,7 +58,7 @@ app.secret_key = SECRET_KEY
 
 # Full-page animated background GIF. You can replace this URL later
 # without changing the rest of the application.
-ANIME_GIF_URL = os.environ.get("ANIME_GIF_URL", "https://tenor.com/view/david-martinez-cyberpunk-edgerunners-cyberpunk-gif-11167589060371146665").strip()
+ANIME_GIF_URL = os.environ.get("ANIME_GIF_URL", "").strip()
 if ANIME_GIF_URL:
     _gif_url_parts = urlparse(ANIME_GIF_URL)
     if not (
@@ -1407,4 +1407,7 @@ def settings_page():
         </select>
 
         <label>Maintenance</label>
-        <select name="main
+        <select name="maintenance">
+          <option value="0" {{ 'selected' if not maintenance else '' }}>OFF</option>
+          <option value="1" {{ 'selected' if maintenance else '' }}>ON</option>
+        <
