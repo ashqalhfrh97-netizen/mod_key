@@ -50,8 +50,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
-SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1").strip()
 
 if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
     raise RuntimeError(
@@ -82,7 +82,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8959881524:AAHJKmUz59
 TELEGRAM_ADMIN_ID = os.environ.get("TELEGRAM_ADMIN_ID", "8299101176").strip()
 TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "MoldesKeysBot").strip().lstrip("@")
 TELEGRAM_BOT_NAME = os.environ.get("TELEGRAM_BOT_NAME", "Key EX25").strip()
-TELEGRAM_POLLING = os.environ.get("TELEGRAM_POLLING", "0") == "1"
+TELEGRAM_POLLING = os.environ.get("TELEGRAM_POLLING", "1") == "1"
 BOT_POLL_OFFSET = 0
 BOT_THREAD_STARTED = False
 BOT_THREAD_LOCK = threading.Lock()
