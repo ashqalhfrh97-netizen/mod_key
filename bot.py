@@ -56,7 +56,10 @@ app.secret_key = SECRET_KEY
 
 # Full-page animated background GIF. You can replace this URL later
 # without changing the rest of the application.
-ANIME_GIF_URL = os.environ.get("ANIME_GIF_URL", "/static/background.gif").strip()
+ANIME_GIF_URL = os.environ.get(
+    "ANIME_GIF_URL",
+    "https://media1.giphy.com/media/cZ7rmKfFYOvYI/200.gif"
+).strip()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=True,       # HTTPS in production
@@ -1353,5 +1356,4 @@ def features_page():
           <td>
             <form method="post" action="{{ url_for('feature_update', feature_id=r['feature_id']) }}">
               <input type="hidden" name="csrf" value="{{ csrf }}">
-              <select name="enabled">
-                <option value="1" 
+              <select name="enab
