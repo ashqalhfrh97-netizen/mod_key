@@ -1,4 +1,5 @@
 
+
 import os
 import json
 import sqlite3
@@ -809,17 +810,66 @@ def save_telegram_user(user):
 
 
 def refresh_telegram_photo(telegram_id):
-    """Store the largest available profile-photo file_id; the bot token stays server-side."""
+    """Store and return the largest available Telegram profile-photo file_id."""
     if not TELEGRAM_BOT_TOKEN:
-        return
+        return ""
     try:
-        result = telegram_api("getUserProfilePhotos", {"user_id": int(telegram_id), "offset": 0, "limit": 1})
+        result = telegram_api(
+            "getUserProfilePhotos",
+            {"user_id": int(telegram_id), "offset": 0, "limit": 1}
+        )
         photos = result.get("photos") or []
         file_id = photos[0][-1].get("file_id", "") if photos and photos[0] else ""
         with db() as c:
-            c.execute("UPDATE telegram_users SET photo_file_id=? WHERE telegram_id=?", (file_id, int(telegram_id)))
+            c.execute(
+                "UPDATE telegram_users SET photo_file_id=? WHERE telegram_id=?",
+                (file_id, int(telegram_id))
+            )
+        return file_id
     except Exception as exc:
         audit("TELEGRAM_PHOTO_ERROR", str(exc)[:300])
+        return ""
+
+
+def notify_admin_new_subscription_request(request_id, user, plan):
+    """Send the applicant's Telegram profile photo and request details to the admin."""
+    if not TELEGRAM_ADMIN_ID:
+        return
+
+    username = user.get("username") or "بدون اسم مستخدم"
+    full_name = " ".join(
+        part for part in (user.get("first_name", ""), user.get("last_name", "")) if part
+    ) or "غير متوفر"
+    caption = (
+        f"طلب اشتراك جديد #{request_id}\n"
+        f"الاسم: {full_name}\n"
+        f"المستخدم: @{username}\n"
+        f"معرّف تيليجرام: {user.get('id')}\n"
+        f"الخطة: {PLAN_LABELS.get(plan, plan)}\n"
+        "هذه صورة الملف الشخصي في تيليجرام. بانتظار صورة حساب اللعبة."
+    )
+
+    with db() as c:
+        row = c.execute(
+            "SELECT photo_file_id FROM telegram_users WHERE telegram_id=?",
+            (int(user["id"]),)
+        ).fetchone()
+    profile_photo = row["photo_file_id"] if row else ""
+
+    try:
+        if profile_photo:
+            bot_send_photo(TELEGRAM_ADMIN_ID, profile_photo, caption)
+        else:
+            bot_send(
+                TELEGRAM_ADMIN_ID,
+                caption + "\n\nلم يضع المستخدم صورة شخصية في تيليجرام أو تعذر جلبها."
+            )
+    except Exception as exc:
+        audit("TELEGRAM_PROFILE_FORWARD_ERROR", str(exc)[:500])
+        try:
+            bot_send(TELEGRAM_ADMIN_ID, caption + "\n\nتعذر إرسال الصورة الشخصية.")
+        except Exception as notify_exc:
+            audit("TELEGRAM_ADMIN_NOTIFY_ERROR", str(notify_exc)[:500])
 
 
 def active_subscription(telegram_id):
@@ -914,12 +964,7 @@ def bot_handle_update(update):
                 "الخطوة التالية: أرسل صورة واضحة من داخل لعبة Bounty Rush يظهر فيها حسابك أو معلومات اللاعب. "
                 "يمكنك إضافة رقم اللاعب أو اسمه في وصف الصورة.\n\n"
                 "لا ترسل كلمة مرور أو رمز تسجيل دخول." + extra)
-            if TELEGRAM_ADMIN_ID:
-                bot_send(TELEGRAM_ADMIN_ID,
-                    f"طلب اشتراك جديد #{request_id}\n"
-                    f"المستخدم: {user.get('first_name','')} (@{user.get('username','')})\n"
-                    f"معرّف تيليجرام: {user['id']}\n"
-                    f"الخطة: {PLAN_LABELS[plan]}\nبانتظار صورة الحساب.")
+            notify_admin_new_subscription_request(request_id, user, plan)
             return
         if data.startswith("req:"):
             if not TELEGRAM_ADMIN_ID or str(user.get("id")) != TELEGRAM_ADMIN_ID:
@@ -979,7 +1024,14 @@ def bot_handle_update(update):
             [{"text": "أسبوع واحد", "callback_data": "plan:week"}, {"text": "شهر واحد", "callback_data": "plan:month"}],
             [{"text": "سنة واحدة", "callback_data": "plan:year"}, {"text": "اشتراك دائم", "callback_data": "plan:lifetime"}]
         ]}
-        bot_send(chat_id, "أهلاً بك! اختر مدة الاشتراك:", markup)
+        bot_send(
+            chat_id,
+            "أهلاً بك! اختر مدة الاشتراك:\n\n"
+            "عند تقديم الطلب، سيتم إرسال صورة ملفك الشخصي المتاحة في تيليجرام إلى الإدارة للمراجعة، "
+            "وبعدها سيُطلب منك إرسال صورة حسابك من داخل لعبة Bounty Rush.\n"
+            "لا ترسل كلمة مرور أو رمز تسجيل الدخول.",
+            markup
+        )
         return
 
     # A photo from the game account is the only accepted subscription proof.
@@ -1206,774 +1258,4 @@ a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
 .brand{display:flex;align-items:center;gap:11px;font-weight:800}.brand-dot{width:11px;height:11px;border-radius:50%;background:var(--green);box-shadow:0 0 18px rgba(52,211,153,.75)}
 .nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#172337;color:#eaf2ff;border:1px solid #2c3e57;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#4d6b94;background:#1c2c44}
 .btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.btn.danger{background:#65152b;border-color:#a83b59}
-.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
-.card{background:linear-gradient(180deg,rgba(18,29,45,.97),rgba(12,20,32,.97));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
-h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}.stat{font-size:30px;font-weight:850;margin-top:5px}.small{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
-input,select,textarea{width:100%;padding:11px 12px;margin:6px 0 12px;background:#09111d;color:#fff;border:1px solid #30435d;border-radius:10px;outline:none}input:focus,select:focus,textarea:focus{border-color:#5b9cff;box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-table{width:100%;border-collapse:separate;border-spacing:0}th,td{padding:11px;border-bottom:1px solid #243247;text-align:left;vertical-align:middle}th{color:#a9bad0;font-size:12px;text-transform:uppercase;letter-spacing:.05em}tr:hover td{background:rgba(59,130,246,.035)}
-.badge{display:inline-flex;padding:4px 9px;border-radius:999px;background:#1c2a3d;border:1px solid #30435d}.ok{color:var(--green)}.bad{color:var(--red)}.inline{display:inline}code{color:#b9d7ff;background:#09111d;padding:3px 6px;border-radius:6px}.login-shell{min-height:92vh;display:grid;place-items:center}.login-card{width:min(460px,100%);padding:26px}.footer{text-align:center;color:#71839a;font-size:12px;margin-top:20px}
-@media(max-width:800px){.topbar{position:static;align-items:flex-start;flex-direction:column}.nav{justify-content:flex-start}.hero-overlay{padding:20px}table{display:block;overflow-x:auto;white-space:nowrap}}
-</style>
-"""
-
-
-def page(title, body):
-    return render_template_string(
-        BASE_STYLE + """
-        <div class="wrap">
-          <header class="topbar">
-            <div class="brand"><span class="brand-dot"></span>Private Control Panel</div>
-            <nav class="nav">
-              <a href="{{ url_for('dashboard') }}">Dashboard</a>
-              <a href="{{ url_for('keys_page') }}">Keys</a>
-              <a href="{{ url_for('devices_page') }}">Devices</a>
-              <a href="{{ url_for('features_page') }}">Permissions</a>
-              <a href="{{ url_for('telegram_subscriptions_page') }}">Telegram Subscriptions</a>
-              <a href="{{ url_for('settings_page') }}">Settings</a>
-              <a href="{{ url_for('logs_page') }}">Logs</a>
-            <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
-              <a href="{{ url_for('logout') }}">Logout</a>
-            </nav>
-          </header>
-          """ + body + """
-          <div class="footer">Secure admin panel • Server time: UTC</div>
-        </div>
-        """,
-        title=title,
-        csrf=csrf_token(),
-        anime_gif_url=ANIME_GIF_URL
-    )
-
-@app.get("/login")
-def login():
-    if session.get("admin"):
-        return redirect(url_for("dashboard"))
-
-    return render_template_string(BASE_STYLE + """
-    <div class="wrap login-shell">
-      <div class="card login-card">
-        <div class="hero" style="margin:-26px -26px 22px;border-radius:17px 17px 0 0;border:0">
-          <div class="hero-overlay"><div><h1>Private Control Panel</h1><p>Administrator access</p></div></div>
-        </div>
-        <p class="small">Administrator login</p>
-        {% if error %}<p class="bad">{{ error }}</p>{% endif %}
-        <form method="post">
-          <input type="hidden" name="csrf" value="{{ csrf }}">
-          <label>Username</label>
-          <input name="username" autocomplete="username" required>
-          <label>Password</label>
-          <input type="password" name="password"
-                 autocomplete="current-password" required>
-          <button class="btn primary" type="submit">Login</button>
-        </form>
-      </div>
-    </div>
-    """, error=None, csrf=csrf_token(), anime_gif_url=ANIME_GIF_URL)
-
-
-@app.post("/login")
-def login_post():
-    if not rate_limit("admin_login", 8, 60):
-        return render_template_string(
-            BASE_STYLE + "<div class='wrap'><div class='card'><p class='bad'>Too many login attempts. Try again later.</p></div></div>"
-        ), 429
-
-    require_csrf()
-
-    username = request.form.get("username", "")
-    password = request.form.get("password", "")
-
-    if hmac.compare_digest(username, ADMIN_USER) and hmac.compare_digest(password, ADMIN_PASS):
-        session.clear()
-        session.permanent = True
-        session["admin"] = True
-        rotate_csrf()
-        audit("ADMIN_LOGIN", "success", current_client_ip())
-        return redirect(url_for("dashboard"))
-
-    audit("ADMIN_LOGIN_FAILED", "invalid credentials", current_client_ip())
-    return render_template_string(
-        BASE_STYLE + """
-        <div class="wrap" style="max-width:450px">
-          <div class="card">
-            <h1>Private Control Panel</h1>
-            <p class="bad">Invalid login</p>
-            <form method="post">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <input name="username" required>
-              <input type="password" name="password" required>
-              <button class="btn primary">Login</button>
-            </form>
-          </div>
-        </div>
-        """,
-        csrf=csrf_token()
-    ), 401
-
-
-@app.get("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
-@app.get("/")
-@admin_required
-def dashboard():
-    with db() as c:
-        total = c.execute("SELECT COUNT(*) n FROM keys").fetchone()["n"]
-        active = c.execute(
-            "SELECT COUNT(*) n FROM keys WHERE active=1"
-        ).fetchone()["n"]
-        devices = c.execute("SELECT COUNT(*) n FROM devices").fetchone()["n"]
-        sessions = c.execute("""
-            SELECT COUNT(*) n FROM api_sessions
-            WHERE revoked=0 AND expires_at>?
-        """, (iso(now_utc()),)).fetchone()["n"]
-
-    body = """
-    <div class="hero">
-      <div class="hero-overlay"><div><h1>Private Control Panel</h1><p>Secure key, device and session management</p></div></div>
-    </div>
-    <div class="grid">
-      <div class="card"><div class="small">Keys</div><div class="stat">{{ total }}</div></div>
-      <div class="card"><div class="small">Active Keys</div><div class="stat">{{ active }}</div></div>
-      <div class="card"><div class="small">Registered Devices</div><div class="stat">{{ devices }}</div></div>
-      <div class="card"><div class="small">Live API Sessions</div><div class="stat">{{ sessions }}</div></div>
-    </div>
-
-    <div class="card">
-      <h2>MOD MENU Status</h2>
-      <p>
-        Enabled:
-        <b class="{{ 'ok' if menu_enabled else 'bad' }}">
-          {{ 'YES' if menu_enabled else 'NO' }}
-        </b>
-      </p>
-      <p>Version: <b>{{ version }}</b></p>
-      <p>Minimum Client: <b>{{ minver }}</b></p>
-      <p>Maintenance: <b>{{ 'ON' if maintenance else 'OFF' }}</b></p>
-    </div>
-    """
-    return page("Dashboard", render_template_string(
-        body,
-        total=total, active=active, devices=devices, sessions=sessions,
-        menu_enabled=get_setting("menu_enabled") == "1",
-        version=get_setting("menu_version"),
-        minver=get_setting("min_client_version"),
-        maintenance=get_setting("maintenance") == "1"
-    ))
-
-
-@app.get("/keys")
-@admin_required
-def keys_page():
-    created_key = session.pop("created_key", None)
-    with db() as c:
-        rows = c.execute("""
-            SELECT
-              k.*,
-              (SELECT COUNT(*) FROM devices d WHERE d.key_id=k.id) AS device_count
-            FROM keys k
-            ORDER BY k.id DESC
-        """).fetchall()
-
-    body = """
-    <h1>Keys</h1>
-
-    {% if created_key %}
-    <div class="card created-key-card">
-      <div class="small">NEW ACTIVATION KEY</div>
-      <div class="created-key-row">
-        <code id="newKey">{{ created_key }}</code>
-        <button type="button" class="btn primary" onclick="copyNewKey()">نسخ</button>
-      </div>
-      <div id="copyStatus" class="small">The new key is ready to copy.</div>
-    </div>
-    {% endif %}
-
-    <div class="card">
-      <h2>Create Key</h2>
-      <form method="post" action="{{ url_for('create_key') }}">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <div class="row">
-          <div>
-            <label>Custom key (optional)</label>
-            <input name="key" placeholder="AK-XXXX-XXXX-XXXX">
-          </div>
-          <div>
-            <label>Device limit</label>
-            <input type="number" name="device_limit" min="1" max="100" value="1">
-          </div>
-          <div>
-            <label>Days (0 = permanent)</label>
-            <input type="number" name="days" min="0" value="30">
-          </div>
-        </div>
-        <input name="note" placeholder="Note">
-        <button class="btn primary">Create</button>
-      </form>
-    </div>
-
-    <div class="card">
-      <table>
-        <tr>
-          <th>Key</th><th>Status</th><th>Devices</th>
-          <th>Expiration</th><th>Actions</th>
-        </tr>
-        {% for r in rows %}
-        <tr>
-          <td><code>{{ r['key'] }}</code><br><span class="small">{{ r['note'] }}</span></td>
-          <td>{{ status(r) }}</td>
-          <td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td>
-          <td>
-            {% if r['expires_at'] %}
-              <span class="countdown" data-exp="{{ r['expires_at'] }}">calculating...</span>
-              <br><span class="small">{{ r['expires_at'] }}</span>
-            {% else %}Permanent{% endif %}
-          </td>
-          <td>
-            <form class="inline" method="post" action="{{ url_for('toggle_key', key_id=r['id']) }}">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <button class="btn">{{ 'Disable' if r['active'] else 'Enable' }}</button>
-            </form>
-            <form class="inline" method="post" action="{{ url_for('delete_key', key_id=r['id']) }}"
-                  onsubmit="return confirm('Delete this key and its devices/sessions?')">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <button class="btn danger">Delete</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </table>
-    </div>
-
-    <script>
-    async function copyNewKey(){
-        const el = document.getElementById("newKey");
-        if (!el) return;
-        const value = el.textContent.trim();
-        try {
-            await navigator.clipboard.writeText(value);
-        } catch (e) {
-            const area = document.createElement("textarea");
-            area.value = value;
-            area.style.position = "fixed";
-            area.style.opacity = "0";
-            document.body.appendChild(area);
-            area.focus();
-            area.select();
-            document.execCommand("copy");
-            area.remove();
-        }
-        const btn = document.querySelector('button[onclick="copyNewKey()"]');
-        if (btn) {
-            const old = btn.textContent;
-            btn.textContent = "تم النسخ ✓";
-            setTimeout(() => btn.textContent = old, 1400);
-        }
-    }
-
-    function countdown(){
-      document.querySelectorAll('[data-exp]').forEach(function(el){
-        const end = new Date(el.dataset.exp).getTime();
-        let sec = Math.max(0, Math.floor((end-Date.now())/1000));
-        const d=Math.floor(sec/86400); sec%=86400;
-        const h=Math.floor(sec/3600); sec%=3600;
-        const m=Math.floor(sec/60); const s=sec%60;
-        el.textContent = d+'d '+h+'h '+m+'m '+s+'s';
-      });
-    }
-    countdown(); setInterval(countdown,1000);
-    </script>
-    """
-    return page("Keys", render_template_string(
-        body, rows=rows, status=key_status, csrf=csrf_token()
-    ))
-
-
-@app.post("/keys/create")
-@admin_required
-def create_key():
-    require_csrf()
-
-    value = normalize_key(request.form.get("key"))
-    if not value:
-        value = generate_key()
-
-    try:
-        device_limit = max(1, min(100, int(request.form.get("device_limit", "1"))))
-        days = max(0, int(request.form.get("days", "30")))
-    except (TypeError, ValueError):
-        return "Invalid device limit or days. <a href='/keys'>Back</a>", 400
-    note = request.form.get("note", "")[:500]
-
-    expires = None if days == 0 else iso(now_utc() + timedelta(days=days))
-
-    try:
-        with db() as c:
-            c.execute("""
-                INSERT INTO keys(key,active,device_limit,expires_at,created_at,note)
-                VALUES(?,?,?,?,?,?)
-            """, (
-                value, 1, device_limit, expires, iso(now_utc()), note
-            ))
-    except sqlite3.IntegrityError:
-        return "Key already exists. <a href='/keys'>Back</a>", 409
-
-    session["created_key"] = value
-    session.modified = True
-    audit("KEY_CREATED", f"key={value[:8]}...")
-    return redirect(url_for("keys_page"))
-
-
-@app.post("/keys/<int:key_id>/toggle")
-@admin_required
-def toggle_key(key_id):
-    require_csrf()
-    with db() as c:
-        row = c.execute(
-            "SELECT active,key FROM keys WHERE id=?",
-            (key_id,)
-        ).fetchone()
-        if not row:
-            abort(404)
-        new_value = 0 if row["active"] else 1
-        c.execute(
-            "UPDATE keys SET active=? WHERE id=?",
-            (new_value, key_id)
-        )
-        if not new_value:
-            c.execute(
-                "UPDATE api_sessions SET revoked=1 WHERE key_id=?",
-                (key_id,)
-            )
-
-    audit("KEY_TOGGLED", f"key_id={key_id} active={new_value}")
-    return redirect(url_for("keys_page"))
-
-
-@app.post("/keys/<int:key_id>/delete")
-@admin_required
-def delete_key(key_id):
-    require_csrf()
-    with db() as c:
-        c.execute("DELETE FROM keys WHERE id=?", (key_id,))
-    audit("KEY_DELETED", f"key_id={key_id}")
-    return redirect(url_for("keys_page"))
-
-
-@app.get("/devices")
-@admin_required
-def devices_page():
-    with db() as c:
-        rows = c.execute("""
-            SELECT d.*, k.key
-            FROM devices d
-            JOIN keys k ON k.id=d.key_id
-            ORDER BY d.last_seen DESC
-        """).fetchall()
-
-    body = """
-    <h1>Devices</h1>
-    <div class="card">
-      <table>
-        <tr><th>Key</th><th>HWID</th><th>First Seen</th><th>Last Seen</th><th>Action</th></tr>
-        {% for r in rows %}
-        <tr>
-          <td>{{ r['key'] }}</td>
-          <td><code>{{ r['hwid'] }}</code></td>
-          <td>{{ r['first_seen'] }}</td>
-          <td>{{ r['last_seen'] }}</td>
-          <td>
-            <form method="post" action="{{ url_for('delete_device', device_id=r['id']) }}">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <button class="btn danger">Remove</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-      </table>
-    </div>
-    """
-    return page("Devices", render_template_string(body, rows=rows, csrf=csrf_token()))
-
-
-@app.post("/devices/<int:device_id>/delete")
-@admin_required
-def delete_device(device_id):
-    require_csrf()
-    with db() as c:
-        row = c.execute(
-            "SELECT key_id,hwid FROM devices WHERE id=?",
-            (device_id,)
-        ).fetchone()
-        if row:
-            c.execute("DELETE FROM devices WHERE id=?", (device_id,))
-            c.execute("""
-                UPDATE api_sessions SET revoked=1
-                WHERE key_id=? AND hwid=?
-            """, (row["key_id"], row["hwid"]))
-    audit("DEVICE_REMOVED", f"device_id={device_id}")
-    return redirect(url_for("devices_page"))
-
-
-@app.get("/features")
-@admin_required
-def features_page():
-    with db() as c:
-        rows = c.execute("""
-            SELECT * FROM feature_permissions
-            ORDER BY feature_id
-        """).fetchall()
-
-    body = """
-    <h1>MOD MENU Permissions</h1>
-
-    <div class="card">
-      <p>
-        Global status:
-        <b class="{{ 'ok' if menu_enabled else 'bad' }}">
-          {{ 'ENABLED' if menu_enabled else 'DISABLED' }}
-        </b>
-      </p>
-      <p class="small">
-        Disabling a feature here prevents the server from granting that
-        feature permission to new/session-refresh responses.
-      </p>
-    </div>
-
-    <div class="card">
-      <table>
-        <tr><th>ID</th><th>Feature</th><th>Global</th><th>Min Version</th><th>Save</th></tr>
-        {% for r in rows %}
-        <tr>
-          <td>{{ r['feature_id'] }}</td>
-          <td>{{ r['name'] }}</td>
-          <td>
-            <form method="post" action="{{ url_for('feature_update', feature_id=r['feature_id']) }}">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <select name="enabled">
-                <option value="1" {{ 'selected' if r['enabled'] else '' }}>Enabled</option>
-                <option value="0" {{ 'selected' if not r['enabled'] else '' }}>Disabled</option>
-              </select>
-          </td>
-          <td><input name="min_client_version" value="{{ r['min_client_version'] }}"></td>
-          <td><button class="btn primary">Save</button></form></td>
-        </tr>
-        {% endfor %}
-      </table>
-    </div>
-    """
-    return page("MOD MENU", render_template_string(
-        body,
-        rows=rows,
-        menu_enabled=get_setting("menu_enabled") == "1",
-        csrf=csrf_token()
-    ))
-
-
-@app.post("/features/<int:feature_id>/update")
-@admin_required
-def feature_update(feature_id):
-    require_csrf()
-    enabled = 1 if request.form.get("enabled") == "1" else 0
-    version = request.form.get("min_client_version", "1.0.0")[:50]
-
-    with db() as c:
-        c.execute("""
-            UPDATE feature_permissions
-            SET enabled=?, min_client_version=?
-            WHERE feature_id=?
-        """, (enabled, version, feature_id))
-
-    audit(
-        "FEATURE_UPDATED",
-        f"id={feature_id} enabled={enabled} min_version={version}"
-    )
-    return redirect(url_for("features_page"))
-
-
-@app.get("/telegram-subscriptions")
-@admin_required
-def telegram_subscriptions_page():
-    with db() as c:
-        requests_rows = c.execute("""
-            SELECT r.*, u.username, u.first_name, u.last_name
-            FROM subscription_requests r LEFT JOIN telegram_users u ON u.telegram_id=r.telegram_id
-            ORDER BY r.id DESC LIMIT 200
-        """).fetchall()
-        subs_rows = c.execute("""
-            SELECT s.*, u.username, u.first_name, k.key,
-                   (SELECT COUNT(*) FROM devices d WHERE d.key_id=s.key_id) AS device_count
-            FROM subscriptions s LEFT JOIN telegram_users u ON u.telegram_id=s.telegram_id
-            JOIN keys k ON k.id=s.key_id ORDER BY s.id DESC LIMIT 200
-        """).fetchall()
-    body = """
-    <h1>اشتراكات تيليجرام</h1>
-    <div class="card">
-      <h2>إعداد البوت</h2>
-      <p class="small">ضع TELEGRAM_BOT_TOKEN و TELEGRAM_ADMIN_ID و TELEGRAM_POLLING=1 في متغيرات الاستضافة. لا تضع رمز البوت هنا أو داخل تطبيق أندرويد.</p>
-      <p>Bot status: <b class="{{ 'ok' if bot_ready else 'bad' }}">{{ 'جاهز' if bot_ready else 'متغيرات الإعداد ناقصة' }}</b></p>
-      <form method="post" action="{{ url_for('telegram_settings_save') }}">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <label>ملاحظة إضافية تظهر للمستخدم (اختياري)</label>
-        <textarea name="payment_instructions" rows="3">{{ payment_instructions }}</textarea>
-        <label>عدد الأجهزة الافتراضي للاشتراكات الجديدة</label>
-        <input type="number" name="device_limit" min="1" max="100" value="{{ device_limit }}">
-        <button class="btn primary">حفظ إعدادات تيليجرام</button>
-      </form>
-    </div>
-    <div class="card"><h2>طلبات الاشتراك</h2><table>
-      <tr><th>الطلب</th><th>المستخدم</th><th>الخطة</th><th>الحالة</th><th>الإثبات</th><th>التاريخ</th><th>الإجراء</th></tr>
-      {% for r in requests_rows %}<tr>
-        <td>#{{ r['id'] }}</td><td>{{ r['first_name'] or '' }} @{{ r['username'] or 'no_username' }}<br><span class="small">{{ r['telegram_id'] }}</span></td>
-        <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td>{{ {'pending':'قيد المراجعة','approved':'مقبول','rejected':'مرفوض'}.get(r['status'],r['status']) }}</td><td>{{ 'تم استلام صورة' if (r['payment_proof'] or '').startswith('photo_file_id:') else 'بانتظار الصورة' }}</td><td>{{ r['created_at'] }}</td><td>
-        {% if r['status']=='pending' %}
-          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='approve') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">موافقة</button></form>
-          <form class="inline" method="post" action="{{ url_for('telegram_request_action', request_id=r['id'], action='reject') }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn danger">رفض</button></form>
-        {% else %}-{% endif %}</td></tr>{% endfor %}
-    </table></div>
-    <div class="card"><h2>المشتركون</h2><table>
-      <tr><th>المستخدم</th><th>الخطة</th><th>المفتاح</th><th>الأجهزة</th><th>الانتهاء</th><th>الحالة</th></tr>
-      {% for r in subs_rows %}<tr><td>{{ r['first_name'] or '' }} @{{ r['username'] or 'no_username' }}<br><span class="small">{{ r['telegram_id'] }}</span></td>
-      <td>{{ plan_labels.get(r['plan'],r['plan']) }}</td><td><code>{{ r['key'] }}</code></td><td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td><td>{{ r['expires_at'] or 'Lifetime' }}</td><td>{{ 'Active' if r['active'] else 'Disabled' }}</td></tr>{% endfor %}
-    </table></div>
-    """
-    return page("Telegram Subscriptions", render_template_string(body, requests_rows=requests_rows,
-        subs_rows=subs_rows, plan_labels=PLAN_LABELS, csrf=csrf_token(),
-        bot_ready=bool(TELEGRAM_BOT_TOKEN and TELEGRAM_ADMIN_ID),
-        payment_instructions=get_setting("payment_instructions", ""),
-        device_limit=get_setting("telegram_device_limit", "1")))
-
-
-@app.post("/telegram-subscriptions/settings")
-@admin_required
-def telegram_settings_save():
-    require_csrf()
-    try:
-        limit = max(1, min(100, int(request.form.get("device_limit", "1"))))
-    except ValueError:
-        abort(400, "Invalid device limit")
-    set_setting("telegram_device_limit", limit)
-    set_setting("payment_instructions", request.form.get("payment_instructions", "")[:2000])
-    audit("TELEGRAM_SETTINGS_UPDATED", f"device_limit={limit}")
-    return redirect(url_for("telegram_subscriptions_page"))
-
-
-@app.post("/telegram-subscriptions/<int:request_id>/<action>")
-@admin_required
-def telegram_request_action(request_id, action):
-    require_csrf()
-    if action == "approve":
-        ok, result = approve_subscription_request(request_id, "web-panel")
-        if ok and TELEGRAM_BOT_TOKEN:
-            try:
-                bot_send(result["telegram_id"], "تمت الموافقة على اشتراكك! افتح التطبيق وأنشئ رمز ربط مؤقت، ثم أرسل الرمز هنا لربط حسابك.")
-            except Exception as exc:
-                audit("TELEGRAM_NOTIFY_ERROR", str(exc)[:500])
-    elif action == "reject":
-        ok, target = reject_subscription_request(request_id, "web-panel")
-        if ok and target and TELEGRAM_BOT_TOKEN:
-            try:
-                bot_send(target, f"لم تتم الموافقة على طلب الاشتراك رقم #{request_id}.")
-            except Exception as exc:
-                audit("TELEGRAM_NOTIFY_ERROR", str(exc)[:500])
-    else:
-        abort(404)
-    return redirect(url_for("telegram_subscriptions_page"))
-
-
-@app.get("/settings")
-@admin_required
-def settings_page():
-    body = """
-    <h1>Server Settings</h1>
-    <div class="card">
-      <form method="post">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <label>MOD MENU</label>
-        <select name="menu_enabled">
-          <option value="1" {{ 'selected' if menu_enabled else '' }}>Enabled</option>
-          <option value="0" {{ 'selected' if not menu_enabled else '' }}>Disabled</option>
-        </select>
-
-        <label>Maintenance</label>
-        <select name="maintenance">
-          <option value="0" {{ 'selected' if not maintenance else '' }}>OFF</option>
-          <option value="1" {{ 'selected' if maintenance else '' }}>ON</option>
-        </select>
-
-        <label>Menu Version</label>
-        <input name="menu_version" value="{{ version }}">
-
-        <label>Minimum Client Version</label>
-        <input name="min_client_version" value="{{ minver }}">
-
-        <label>Announcement</label>
-        <textarea name="announcement" rows="4">{{ announcement }}</textarea>
-
-        <button class="btn primary">Save Settings</button>
-      </form>
-    </div>
-    """
-    return page("Settings", render_template_string(
-        body,
-        menu_enabled=get_setting("menu_enabled") == "1",
-        maintenance=get_setting("maintenance") == "1",
-        version=get_setting("menu_version", "1.0.0"),
-        minver=get_setting("min_client_version", "1.0.0"),
-        announcement=get_setting("announcement", ""),
-        csrf=csrf_token()
-    ))
-
-
-@app.post("/settings")
-@admin_required
-def settings_save():
-    require_csrf()
-
-    set_setting("menu_enabled", "1" if request.form.get("menu_enabled") == "1" else "0")
-    set_setting("maintenance", "1" if request.form.get("maintenance") == "1" else "0")
-    set_setting("menu_version", request.form.get("menu_version", "1.0.0")[:50])
-    set_setting("min_client_version", request.form.get("min_client_version", "1.0.0")[:50])
-    set_setting("announcement", request.form.get("announcement", "")[:2000])
-
-    # Kill switch: immediately revoke all sessions.
-    if get_setting("menu_enabled") != "1" or get_setting("maintenance") == "1":
-        with db() as c:
-            c.execute("UPDATE api_sessions SET revoked=1 WHERE revoked=0")
-
-    audit("SETTINGS_UPDATED", "server settings changed")
-    return redirect(url_for("settings_page"))
-
-
-@app.get("/login-activity")
-@admin_required
-def login_activity_page():
-    with db() as c:
-        rows = c.execute("""
-            SELECT created_at,event,ip,details
-            FROM audit_logs
-            WHERE event IN (
-                'API_LOGIN_OK',
-                'API_LOGIN_FAILED',
-                'ADMIN_LOGIN',
-                'ADMIN_LOGIN_FAILED'
-            )
-            ORDER BY id DESC
-            LIMIT 500
-        """).fetchall()
-
-    body = """
-    <h1>Login Activity</h1>
-    <div class="card">
-      <p class="small">
-        Successful and failed login attempts with IP, masked key,
-        HWID prefix and client version.
-      </p>
-      <div class="table-scroll">
-      <table>
-        <tr><th>Time</th><th>Result</th><th>IP</th><th>Details</th></tr>
-        {% for r in rows %}
-        <tr>
-          <td>{{ r['created_at'] }}</td>
-          <td>
-            {% if r['event'] in ['API_LOGIN_OK','ADMIN_LOGIN'] %}
-              <span class="ok">{{ r['event'] }}</span>
-            {% else %}
-              <span class="bad">{{ r['event'] }}</span>
-            {% endif %}
-          </td>
-          <td><code>{{ r['ip'] or 'unknown' }}</code></td>
-          <td>{{ r['details'] }}</td>
-        </tr>
-        {% endfor %}
-      </table>
-      </div>
-    </div>
-    """
-    return page("Login Activity", render_template_string(body, rows=rows))
-
-
-@app.get("/logs")
-@admin_required
-def logs_page():
-    with db() as c:
-        rows = c.execute("""
-            SELECT * FROM audit_logs
-            ORDER BY id DESC LIMIT 300
-        """).fetchall()
-
-    body = """
-    <h1>Audit Logs</h1>
-    <div class="card">
-      <table>
-        <tr><th>Time</th><th>Event</th><th>IP</th><th>Details</th></tr>
-        {% for r in rows %}
-        <tr>
-          <td>{{ r['created_at'] }}</td>
-          <td>{{ r['event'] }}</td>
-          <td>{{ r['ip'] }}</td>
-          <td>{{ r['details'] }}</td>
-        </tr>
-        {% endfor %}
-      </table>
-    </div>
-    """
-    return page("Logs", render_template_string(body, rows=rows, csrf=csrf_token()))
-
-
-# ============================================================
-# SECURITY HEADERS / ERROR RESPONSES
-# ============================================================
-
-@app.after_request
-def security_headers(response):
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: https://media.tenor.com;"
-    )
-    return response
-
-
-@app.errorhandler(400)
-def bad_request(e):
-    if request.path.startswith("/api/"):
-        return jsonify({"success": False, "message": str(e)}), 400
-    message = str(e)
-    if "Invalid CSRF token" in message:
-        return render_template_string(BASE_STYLE + """
-        <div class="wrap login-shell"><div class="card login-card">
-          <h1>Session expired</h1>
-          <p class="small">The security token for this page is no longer valid. Reload the panel and try again.</p>
-          <a class="btn primary" href="{{ url_for('keys_page') }}">Reload Keys</a>
-        </div></div>
-        """), 400
-    return message, 400
-
-
-@app.errorhandler(404)
-def not_found(e):
-    if request.path.startswith("/api/"):
-        return jsonify({"success": False, "message": "Not found"}), 404
-    return "Not found", 404
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-init_db()
-
-if __name__ == "__main__":
-    start_telegram_polling()
-    port = int(os.environ.get("PORT", "8080"))
-    # Host must be 0.0.0.0 for Railway/Render/etc.
-    app.run(host="0.0.0.0", port=port, debug=False)
+.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7
