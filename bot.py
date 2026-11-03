@@ -6,7 +6,6 @@ import secrets
 import hashlib
 import hmac
 import time
-import ipaddress
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 from urllib.parse import urlparse
@@ -43,8 +42,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 app = Flask(__name__)
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011")
-SECRET_KEY = os.environ.get("SECRET_KEY", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1")
+# Set these in your hosting provider's environment variables.
+# The fallback values keep older deployments bootable, but MUST be rotated
+# before public use because source-code defaults are not secret.
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc").strip()
 
 if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
     raise RuntimeError(
@@ -58,7 +60,7 @@ app.secret_key = SECRET_KEY
 # without changing the rest of the application.
 ANIME_GIF_URL = os.environ.get(
     "ANIME_GIF_URL",
-    "https://media1.giphy.com/media/cZ7rmKfFYOvYI/200.gif"
+    "https://media.tenor.com/images/7f3d3c7c7e5f4f7d8e7f7c6c4a0b0d4b/tenor.gif"
 ).strip()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -145,6 +147,28 @@ def init_db():
             FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS device_ips (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key_id INTEGER NOT NULL,
+            hwid TEXT NOT NULL,
+            ip TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            UNIQUE(key_id, hwid, ip),
+            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS bans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ban_type TEXT NOT NULL CHECK(ban_type IN ('IP','HWID')),
+            value TEXT NOT NULL,
+            reason TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT DEFAULT 'admin'
+        );
+
         CREATE TABLE IF NOT EXISTS api_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             token_hash TEXT NOT NULL UNIQUE,
@@ -180,31 +204,17 @@ def init_db():
             FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE,
             FOREIGN KEY(feature_id) REFERENCES feature_permissions(feature_id) ON DELETE CASCADE
         );
-
-        CREATE TABLE IF NOT EXISTS device_ips (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            key_id INTEGER NOT NULL,
-            hwid TEXT NOT NULL,
-            ip TEXT NOT NULL,
-            first_seen TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            UNIQUE(key_id, hwid, ip),
-            FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE
-        );
-
-        CREATE TABLE IF NOT EXISTS security_blocks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            block_type TEXT NOT NULL CHECK(block_type IN ('ip','hwid')),
-            subject TEXT NOT NULL,
-            reason TEXT DEFAULT '',
-            created_at TEXT NOT NULL,
-            expires_at TEXT,
-            active INTEGER NOT NULL DEFAULT 1,
-            UNIQUE(block_type, subject)
-        );
-        CREATE INDEX IF NOT EXISTS idx_device_ips_ip ON device_ips(ip);
-        CREATE INDEX IF NOT EXISTS idx_security_blocks_lookup ON security_blocks(block_type, subject, active);
         """)
+
+        # Safe additive migrations for databases created by older versions.
+        device_columns = {
+            row["name"] for row in c.execute("PRAGMA table_info(devices)").fetchall()
+        }
+        if "last_ip" not in device_columns:
+            c.execute("ALTER TABLE devices ADD COLUMN last_ip TEXT DEFAULT ''")
+
+        c.execute("CREATE INDEX IF NOT EXISTS idx_device_ips_ip ON device_ips(ip)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_bans_lookup ON bans(ban_type,value,active)")
 
         defaults = {
             "menu_enabled": "1",
@@ -383,53 +393,49 @@ def hash_token(token):
 
 
 def current_client_ip():
-    # Use the direct peer address by default. Only trust forwarded headers
-    # when the deployment explicitly enables them behind a trusted proxy.
+    # Do not trust arbitrary X-Forwarded-For headers. Enable proxy parsing
+    # only when the hosting proxy is explicitly configured as trusted.
+    remote = request.remote_addr or ""
     if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1":
         forwarded = request.headers.get("X-Forwarded-For", "")
-        candidate = forwarded.split(",", 1)[0].strip()
-        try:
-            return str(ipaddress.ip_address(candidate))
-        except ValueError:
-            pass
-    try:
-        return str(ipaddress.ip_address(request.remote_addr or ""))
-    except ValueError:
-        return request.remote_addr or ""
+        candidate = forwarded.split(",")[0].strip()
+        if candidate and len(candidate) <= 64:
+            return candidate
+    return remote
 
 
-def record_device_ip(key_id, hwid, ip_value):
-    if not ip_value:
+def active_ban(ban_type, value):
+    if not value:
+        return None
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM bans
+            WHERE ban_type=? AND value=? AND active=1
+            ORDER BY id DESC
+        """, (ban_type, value)).fetchall()
+        for row in rows:
+            expiry = parse_iso(row["expires_at"])
+            if expiry is None or expiry > now_utc():
+                return row
+            c.execute("UPDATE bans SET active=0 WHERE id=?", (row["id"],))
+    return None
+
+
+def record_device_ip(key_id, hwid, ip):
+    if not ip:
         return
     stamp = iso(now_utc())
     with db() as c:
         c.execute("""
             INSERT INTO device_ips(key_id,hwid,ip,first_seen,last_seen)
             VALUES(?,?,?,?,?)
-            ON CONFLICT(key_id,hwid,ip) DO UPDATE SET last_seen=excluded.last_seen
-        """, (key_id, hwid, ip_value, stamp, stamp))
-
-
-def is_security_blocked(block_type, subject, conn=None):
-    if not subject:
-        return False
-    own_conn = conn is None
-    c = conn or db()
-    try:
-        row = c.execute("""
-            SELECT id,expires_at FROM security_blocks
-            WHERE block_type=? AND subject=? AND active=1
-        """, (block_type, subject)).fetchone()
-        if not row:
-            return False
-        expiry = parse_iso(row["expires_at"])
-        if expiry and expiry <= now_utc():
-            c.execute("UPDATE security_blocks SET active=0 WHERE id=?", (row["id"],))
-            return False
-        return True
-    finally:
-        if own_conn:
-            c.close()
+            ON CONFLICT(key_id,hwid,ip)
+            DO UPDATE SET last_seen=excluded.last_seen
+        """, (key_id, hwid, ip, stamp, stamp))
+        c.execute("""
+            UPDATE devices SET last_ip=?, last_seen=?
+            WHERE key_id=? AND hwid=?
+        """, (ip, stamp, key_id, hwid))
 
 
 # ============================================================
@@ -585,8 +591,11 @@ def api_login():
         return jsonify({"success": False, "message": "Invalid device id"}), 400
 
     client_ip = current_client_ip()
-    if is_security_blocked("ip", client_ip) or is_security_blocked("hwid", hwid):
-        audit("API_LOGIN_BLOCKED", f"hwid={hwid[:16]}...", client_ip)
+    ip_ban = active_ban("IP", client_ip)
+    hwid_ban = active_ban("HWID", hwid)
+    if ip_ban or hwid_ban:
+        ban = ip_ban or hwid_ban
+        audit("API_LOGIN_BLOCKED", f"type={ban['ban_type']} reason={ban['reason']}", client_ip)
         return jsonify({"success": False, "message": "Access blocked by administrator"}), 403
 
     key_row, device, error = valid_key_for_device(key_value, hwid, True)
@@ -603,7 +612,6 @@ def api_login():
         }), 403
 
     record_device_ip(key_row["id"], hwid, client_ip)
-
     menu = menu_payload(key_row)
 
     if not menu["menu_enabled"]:
@@ -687,7 +695,7 @@ def require_api_session():
         if not row:
             return None, "Invalid session"
 
-        if is_security_blocked("ip", current_client_ip(), c) or is_security_blocked("hwid", row["hwid"], c):
+        if active_ban("IP", current_client_ip()) or active_ban("HWID", row["hwid"]):
             c.execute("UPDATE api_sessions SET revoked=1 WHERE id=?", (row["id"],))
             return None, "Access blocked by administrator"
 
@@ -792,7 +800,7 @@ a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;padding:14px 16px;background:rgba(16,25,39,.9);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;position:sticky;top:12px;z-index:20;box-shadow:0 18px 55px rgba(0,0,0,.3)}
 .brand{display:flex;align-items:center;gap:11px;font-weight:800}.brand-dot{width:11px;height:11px;border-radius:50%;background:var(--green);box-shadow:0 0 18px rgba(52,211,153,.75)}
 .nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#172337;color:#eaf2ff;border:1px solid #2c3e57;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#4d6b94;background:#1c2c44}
-.btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.copy-btn{padding:5px 9px;font-size:12px;margin-left:6px}.ip-cell{white-space:nowrap}.btn.danger{background:#65152b;border-color:#a83b59}
+.btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.btn.danger{background:#65152b;border-color:#a83b59}
 .hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
 .card{background:linear-gradient(180deg,rgba(18,29,45,.97),rgba(12,20,32,.97));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
 h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}.stat{font-size:30px;font-weight:850;margin-top:5px}.small{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
@@ -813,13 +821,14 @@ def page(title, body):
             <nav class="nav">
               <a href="{{ url_for('dashboard') }}">Dashboard</a>
               <a href="{{ url_for('keys_page') }}">Keys</a>
-              <a href="{{ url_for('devices_page') }}">Devices</a>
-              <a href="{{ url_for('ips_page') }}">IP Addresses</a>
-              <a href="{{ url_for('security_page') }}">Security / Block</a>
+              <a href="{{ url_for('devices_page') }}">Devices / IPs</a>
+              <a href="{{ url_for('bans_page') }}">Block System</a>
+              <a href="{{ url_for('sessions_page') }}">Sessions</a>
+              <a href="{{ url_for('backup_database') }}">Backup DB</a>
               <a href="{{ url_for('features_page') }}">Permissions</a>
               <a href="{{ url_for('settings_page') }}">Settings</a>
-              <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
               <a href="{{ url_for('logs_page') }}">Logs</a>
+            <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
               <a href="{{ url_for('logout') }}">Logout</a>
             </nav>
           </header>
@@ -918,6 +927,15 @@ def dashboard():
             SELECT COUNT(*) n FROM api_sessions
             WHERE revoked=0 AND expires_at>?
         """, (iso(now_utc()),)).fetchone()["n"]
+        ips = c.execute("SELECT COUNT(DISTINCT ip) n FROM device_ips").fetchone()["n"]
+        blocked = c.execute("""
+            SELECT COUNT(*) n FROM bans
+            WHERE active=1 AND (expires_at IS NULL OR expires_at>?)
+        """, (iso(now_utc()),)).fetchone()["n"]
+        recent_logins = c.execute("""
+            SELECT COUNT(*) n FROM audit_logs
+            WHERE event='API_LOGIN_OK' AND created_at>=?
+        """, (iso(now_utc() - timedelta(hours=24)),)).fetchone()["n"]
 
     body = """
     <div class="hero">
@@ -928,6 +946,9 @@ def dashboard():
       <div class="card"><div class="small">Active Keys</div><div class="stat">{{ active }}</div></div>
       <div class="card"><div class="small">Registered Devices</div><div class="stat">{{ devices }}</div></div>
       <div class="card"><div class="small">Live API Sessions</div><div class="stat">{{ sessions }}</div></div>
+      <div class="card"><div class="small">Known IP Addresses</div><div class="stat">{{ ips }}</div></div>
+      <div class="card"><div class="small">Active Bans</div><div class="stat">{{ blocked }}</div></div>
+      <div class="card"><div class="small">Successful Logins (24h)</div><div class="stat">{{ recent_logins }}</div></div>
     </div>
 
     <div class="card">
@@ -946,6 +967,7 @@ def dashboard():
     return page("Dashboard", render_template_string(
         body,
         total=total, active=active, devices=devices, sessions=sessions,
+        ips=ips, blocked=blocked, recent_logins=recent_logins,
         menu_enabled=get_setting("menu_enabled") == "1",
         version=get_setting("menu_version"),
         minver=get_setting("min_client_version"),
@@ -1154,47 +1176,93 @@ def delete_key(key_id):
 @app.get("/devices")
 @admin_required
 def devices_page():
+    term = request.args.get("q", "").strip()[:200]
     with db() as c:
-        rows = c.execute("""
-            SELECT d.*, k.key,
-                   (SELECT GROUP_CONCAT(ip, ', ') FROM device_ips x
-                    WHERE x.key_id=d.key_id AND x.hwid=d.hwid) AS ip_list
-            FROM devices d
-            JOIN keys k ON k.id=d.key_id
-            ORDER BY d.last_seen DESC
-        """).fetchall()
+        if term:
+            like = f"%{term}%"
+            rows = c.execute("""
+                SELECT d.*, k.key,
+                       COALESCE((SELECT GROUP_CONCAT(ip, ', ')
+                         FROM device_ips x
+                         WHERE x.key_id=d.key_id AND x.hwid=d.hwid), '') AS ips
+                FROM devices d JOIN keys k ON k.id=d.key_id
+                WHERE d.hwid LIKE ? OR k.key LIKE ? OR d.last_ip LIKE ?
+                   OR EXISTS (SELECT 1 FROM device_ips x
+                              WHERE x.key_id=d.key_id AND x.hwid=d.hwid AND x.ip LIKE ?)
+                ORDER BY d.last_seen DESC
+            """, (like, like, like, like)).fetchall()
+        else:
+            rows = c.execute("""
+                SELECT d.*, k.key,
+                       COALESCE((SELECT GROUP_CONCAT(ip, ', ')
+                         FROM device_ips x
+                         WHERE x.key_id=d.key_id AND x.hwid=d.hwid), '') AS ips
+                FROM devices d JOIN keys k ON k.id=d.key_id
+                ORDER BY d.last_seen DESC
+            """).fetchall()
 
     body = """
-    <h1>Devices</h1>
+    <h1>Devices & IP Addresses</h1>
     <div class="card">
-      <table>
-        <tr><th>Key</th><th>HWID</th><th>IP Addresses</th><th>First Seen</th><th>Last Seen</th><th>Action</th></tr>
+      <form method="get">
+        <input name="q" value="{{ term }}" placeholder="Search IP, HWID or key">
+        <button class="btn primary">Search</button>
+        <a class="btn" href="{{ url_for('devices_page') }}">Clear</a>
+        <a class="btn" href="{{ url_for('export_devices') }}">Export CSV</a>
+      </form>
+      <div class="table-scroll"><table>
+        <tr><th>Key</th><th>HWID</th><th>IP addresses</th><th>First seen</th><th>Last seen</th><th>Actions</th></tr>
         {% for r in rows %}
         <tr>
-          <td>{{ r['key'] }}</td>
-          <td><code>{{ r['hwid'] }}</code><button type="button" class="btn copy-btn" onclick="copyText({{ r['hwid']|tojson }},this)">Copy</button></td>
-          <td class="ip-cell">{% for ip in (r['ip_list'] or '').split(', ') if ip %}<div><code>{{ ip }}</code><button type="button" class="btn copy-btn" onclick="copyText({{ ip|tojson }},this)">Copy</button></div>{% else %}<span class="small">No IP recorded yet</span>{% endfor %}</td>
-          <td>{{ r['first_seen'] }}</td>
-          <td>{{ r['last_seen'] }}</td>
+          <td><code>{{ r['key'] }}</code></td>
+          <td><code>{{ r['hwid'] }}</code> <button type="button" class="btn" onclick="copyText({{ r['hwid']|tojson }})">Copy</button></td>
           <td>
-            <form method="post" action="{{ url_for('delete_device', device_id=r['id']) }}">
+            {% if r['ips'] %}
+              {% for ip in r['ips'].split(', ') %}
+                <div><code>{{ ip }}</code> <button type="button" class="btn" onclick="copyText({{ ip|tojson }})">Copy</button>
+                <form class="inline" method="post" action="{{ url_for('create_ban') }}">
+                  <input type="hidden" name="csrf" value="{{ csrf }}">
+                  <input type="hidden" name="ban_type" value="IP">
+                  <input type="hidden" name="value" value="{{ ip }}">
+                  <input type="hidden" name="duration" value="permanent">
+                  <input type="hidden" name="reason" value="Blocked from device list">
+                  <button class="btn danger">Block IP</button>
+                </form></div>
+              {% endfor %}
+            {% else %}<span class="small">No IP recorded yet</span>{% endif %}
+          </td>
+          <td>{{ r['first_seen'] }}</td><td>{{ r['last_seen'] }}</td>
+          <td>
+            <form class="inline" method="post" action="{{ url_for('create_ban') }}">
               <input type="hidden" name="csrf" value="{{ csrf }}">
-              <button class="btn danger">Remove</button>
+              <input type="hidden" name="ban_type" value="HWID">
+              <input type="hidden" name="value" value="{{ r['hwid'] }}">
+              <input type="hidden" name="duration" value="permanent">
+              <input type="hidden" name="reason" value="Blocked from device list">
+              <button class="btn danger">Block HWID</button>
+            </form>
+            <form class="inline" method="post" action="{{ url_for('delete_device', device_id=r['id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn">Unregister</button>
             </form>
           </td>
         </tr>
         {% endfor %}
-      </table>
+      </table></div>
     </div>
     <script>
-    async function copyText(value, button){
+    async function copyText(value){
       try { await navigator.clipboard.writeText(value); }
-      catch(e){ const a=document.createElement('textarea'); a.value=value; document.body.appendChild(a); a.select(); document.execCommand('copy'); a.remove(); }
-      const old=button.textContent; button.textContent='Copied ✓'; setTimeout(()=>button.textContent=old,1200);
+      catch(e){
+        const t=document.createElement('textarea'); t.value=value;
+        document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove();
+      }
     }
     </script>
     """
-    return page("Devices", render_template_string(body, rows=rows, csrf=csrf_token()))
+    return page("Devices & IPs", render_template_string(
+        body, rows=rows, term=term, csrf=csrf_token()
+    ))
 
 
 @app.post("/devices/<int:device_id>/delete")
@@ -1214,111 +1282,6 @@ def delete_device(device_id):
             """, (row["key_id"], row["hwid"]))
     audit("DEVICE_REMOVED", f"device_id={device_id}")
     return redirect(url_for("devices_page"))
-
-
-@app.get("/ips")
-@admin_required
-def ips_page():
-    with db() as c:
-        rows = c.execute("""
-            SELECT x.*, k.key
-            FROM device_ips x JOIN keys k ON k.id=x.key_id
-            ORDER BY x.last_seen DESC LIMIT 1000
-        """).fetchall()
-    body = """
-    <h1>Device IP Addresses</h1>
-    <div class="card"><p class="small">IP addresses recorded when a device successfully logs in. Copy any address with one click.</p>
-      <table><tr><th>IP</th><th>Device HWID</th><th>Key</th><th>First Seen</th><th>Last Seen</th></tr>
-      {% for r in rows %}<tr>
-        <td><code>{{ r['ip'] }}</code><button type="button" class="btn copy-btn" onclick="copyText({{ r['ip']|tojson }},this)">Copy IP</button></td>
-        <td><code>{{ r['hwid'] }}</code><button type="button" class="btn copy-btn" onclick="copyText({{ r['hwid']|tojson }},this)">Copy HWID</button></td>
-        <td>{{ r['key'] }}</td><td>{{ r['first_seen'] }}</td><td>{{ r['last_seen'] }}</td>
-      </tr>{% endfor %}</table>
-    </div>
-    <script>async function copyText(v,b){try{await navigator.clipboard.writeText(v)}catch(e){const a=document.createElement('textarea');a.value=v;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}const t=b.textContent;b.textContent='Copied ✓';setTimeout(()=>b.textContent=t,1200)}</script>
-    """
-    return page("IP Addresses", render_template_string(body, rows=rows))
-
-
-@app.get("/security")
-@admin_required
-def security_page():
-    with db() as c:
-        rows = c.execute("SELECT * FROM security_blocks ORDER BY id DESC").fetchall()
-    body = """
-    <h1>Security / Block</h1>
-    <div class="card"><h2>Add Block</h2>
-      <form method="post" action="{{ url_for('security_block') }}">
-        <input type="hidden" name="csrf" value="{{ csrf }}">
-        <div class="row"><div><label>Block type</label><select name="block_type"><option value="ip">IP Address</option><option value="hwid">Device HWID</option></select></div>
-        <div><label>Duration</label><select name="duration"><option value="permanent">Permanent</option><option value="1">1 hour</option><option value="24">24 hours</option><option value="168">7 days</option></select></div></div>
-        <label>IP or HWID</label><input name="subject" maxlength="256" required placeholder="Enter IP address or device HWID">
-        <label>Reason (optional)</label><input name="reason" maxlength="300" placeholder="Reason for block">
-        <button class="btn danger" type="submit">Block</button>
-      </form>
-    </div>
-    <div class="card"><h2>Block List</h2><table>
-      <tr><th>Type</th><th>Value</th><th>Reason</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr>
-      {% for r in rows %}<tr><td>{{ r['block_type']|upper }}</td><td><code>{{ r['subject'] }}</code><button class="btn copy-btn" type="button" onclick="copyText({{ r['subject']|tojson }},this)">Copy</button></td>
-      <td>{{ r['reason'] }}</td><td>{{ r['created_at'] }}</td><td>{{ r['expires_at'] or 'Permanent' }}</td>
-      <td>{{ 'Active' if r['active'] else 'Inactive' }}</td><td>{% if r['active'] %}<form method="post" action="{{ url_for('security_unblock', block_id=r['id']) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">Unblock</button></form>{% endif %}</td></tr>{% endfor %}
-    </table></div>
-    <script>async function copyText(v,b){try{await navigator.clipboard.writeText(v)}catch(e){const a=document.createElement('textarea');a.value=v;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}const t=b.textContent;b.textContent='Copied ✓';setTimeout(()=>b.textContent=t,1200)}</script>
-    """
-    return page("Security / Block", render_template_string(body, rows=rows, csrf=csrf_token()))
-
-
-@app.post("/security/block")
-@admin_required
-def security_block():
-    require_csrf()
-    block_type = request.form.get("block_type", "").strip().lower()
-    subject = request.form.get("subject", "").strip()
-    reason = request.form.get("reason", "")[:300].strip()
-    duration = request.form.get("duration", "permanent")
-    if block_type not in ("ip", "hwid") or not subject or len(subject) > 256:
-        abort(400, "Invalid block data")
-    if block_type == "ip":
-        try:
-            subject = str(ipaddress.ip_address(subject))
-        except ValueError:
-            abort(400, "Invalid IP address")
-    expires = None
-    if duration != "permanent":
-        try:
-            hours = int(duration)
-            if hours not in (1, 24, 168):
-                raise ValueError
-            expires = iso(now_utc() + timedelta(hours=hours))
-        except ValueError:
-            abort(400, "Invalid block duration")
-    with db() as c:
-        c.execute("""
-            INSERT INTO security_blocks(block_type,subject,reason,created_at,expires_at,active)
-            VALUES(?,?,?,?,?,1)
-            ON CONFLICT(block_type,subject) DO UPDATE SET
-              reason=excluded.reason, created_at=excluded.created_at,
-              expires_at=excluded.expires_at, active=1
-        """, (block_type, subject, reason, iso(now_utc()), expires))
-        if block_type == "hwid":
-            c.execute("UPDATE api_sessions SET revoked=1 WHERE hwid=?", (subject,))
-        else:
-            # Revoke sessions associated with devices that have used this IP.
-            c.execute("""UPDATE api_sessions SET revoked=1 WHERE EXISTS (
-                SELECT 1 FROM device_ips x WHERE x.key_id=api_sessions.key_id
-                AND x.hwid=api_sessions.hwid AND x.ip=?)""", (subject,))
-    audit("SECURITY_BLOCK_ADDED", f"type={block_type} subject={subject[:80]} reason={reason}", current_client_ip())
-    return redirect(url_for("security_page"))
-
-
-@app.post("/security/unblock/<int:block_id>")
-@admin_required
-def security_unblock(block_id):
-    require_csrf()
-    with db() as c:
-        c.execute("UPDATE security_blocks SET active=0 WHERE id=?", (block_id,))
-    audit("SECURITY_BLOCK_REMOVED", f"block_id={block_id}", current_client_ip())
-    return redirect(url_for("security_page"))
 
 
 @app.get("/features")
@@ -1356,4 +1319,406 @@ def features_page():
           <td>
             <form method="post" action="{{ url_for('feature_update', feature_id=r['feature_id']) }}">
               <input type="hidden" name="csrf" value="{{ csrf }}">
-              <select name="enab
+              <select name="enabled">
+                <option value="1" {{ 'selected' if r['enabled'] else '' }}>Enabled</option>
+                <option value="0" {{ 'selected' if not r['enabled'] else '' }}>Disabled</option>
+              </select>
+          </td>
+          <td><input name="min_client_version" value="{{ r['min_client_version'] }}"></td>
+          <td><button class="btn primary">Save</button></form></td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("MOD MENU", render_template_string(
+        body,
+        rows=rows,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        csrf=csrf_token()
+    ))
+
+
+@app.post("/features/<int:feature_id>/update")
+@admin_required
+def feature_update(feature_id):
+    require_csrf()
+    enabled = 1 if request.form.get("enabled") == "1" else 0
+    version = request.form.get("min_client_version", "1.0.0")[:50]
+
+    with db() as c:
+        c.execute("""
+            UPDATE feature_permissions
+            SET enabled=?, min_client_version=?
+            WHERE feature_id=?
+        """, (enabled, version, feature_id))
+
+    audit(
+        "FEATURE_UPDATED",
+        f"id={feature_id} enabled={enabled} min_version={version}"
+    )
+    return redirect(url_for("features_page"))
+
+
+@app.get("/settings")
+@admin_required
+def settings_page():
+    body = """
+    <h1>Server Settings</h1>
+    <div class="card">
+      <form method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>MOD MENU</label>
+        <select name="menu_enabled">
+          <option value="1" {{ 'selected' if menu_enabled else '' }}>Enabled</option>
+          <option value="0" {{ 'selected' if not menu_enabled else '' }}>Disabled</option>
+        </select>
+
+        <label>Maintenance</label>
+        <select name="maintenance">
+          <option value="0" {{ 'selected' if not maintenance else '' }}>OFF</option>
+          <option value="1" {{ 'selected' if maintenance else '' }}>ON</option>
+        </select>
+
+        <label>Menu Version</label>
+        <input name="menu_version" value="{{ version }}">
+
+        <label>Minimum Client Version</label>
+        <input name="min_client_version" value="{{ minver }}">
+
+        <label>Announcement</label>
+        <textarea name="announcement" rows="4">{{ announcement }}</textarea>
+
+        <button class="btn primary">Save Settings</button>
+      </form>
+    </div>
+    """
+    return page("Settings", render_template_string(
+        body,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        maintenance=get_setting("maintenance") == "1",
+        version=get_setting("menu_version", "1.0.0"),
+        minver=get_setting("min_client_version", "1.0.0"),
+        announcement=get_setting("announcement", ""),
+        csrf=csrf_token()
+    ))
+
+
+@app.post("/settings")
+@admin_required
+def settings_save():
+    require_csrf()
+
+    set_setting("menu_enabled", "1" if request.form.get("menu_enabled") == "1" else "0")
+    set_setting("maintenance", "1" if request.form.get("maintenance") == "1" else "0")
+    set_setting("menu_version", request.form.get("menu_version", "1.0.0")[:50])
+    set_setting("min_client_version", request.form.get("min_client_version", "1.0.0")[:50])
+    set_setting("announcement", request.form.get("announcement", "")[:2000])
+
+    # Kill switch: immediately revoke all sessions.
+    if get_setting("menu_enabled") != "1" or get_setting("maintenance") == "1":
+        with db() as c:
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE revoked=0")
+
+    audit("SETTINGS_UPDATED", "server settings changed")
+    return redirect(url_for("settings_page"))
+
+
+@app.get("/login-activity")
+@admin_required
+def login_activity_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT created_at,event,ip,details
+            FROM audit_logs
+            WHERE event IN (
+                'API_LOGIN_OK',
+                'API_LOGIN_FAILED',
+                'ADMIN_LOGIN',
+                'ADMIN_LOGIN_FAILED'
+            )
+            ORDER BY id DESC
+            LIMIT 500
+        """).fetchall()
+
+    body = """
+    <h1>Login Activity</h1>
+    <div class="card">
+      <p class="small">
+        Successful and failed login attempts with IP, masked key,
+        HWID prefix and client version.
+      </p>
+      <div class="table-scroll">
+      <table>
+        <tr><th>Time</th><th>Result</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>
+            {% if r['event'] in ['API_LOGIN_OK','ADMIN_LOGIN'] %}
+              <span class="ok">{{ r['event'] }}</span>
+            {% else %}
+              <span class="bad">{{ r['event'] }}</span>
+            {% endif %}
+          </td>
+          <td><code>{{ r['ip'] or 'unknown' }}</code></td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      </div>
+    </div>
+    """
+    return page("Login Activity", render_template_string(body, rows=rows))
+
+
+@app.get("/logs")
+@admin_required
+def logs_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM audit_logs
+            ORDER BY id DESC LIMIT 300
+        """).fetchall()
+
+    body = """
+    <h1>Audit Logs</h1>
+    <div class="card">
+      <table>
+        <tr><th>Time</th><th>Event</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>{{ r['event'] }}</td>
+          <td>{{ r['ip'] }}</td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("Logs", render_template_string(body, rows=rows, csrf=csrf_token()))
+
+
+# ============================================================
+# BLOCK SYSTEM / SESSIONS / EXPORTS / BACKUP
+# ============================================================
+
+@app.get("/bans")
+@admin_required
+def bans_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM bans ORDER BY id DESC LIMIT 500
+        """).fetchall()
+    body = """
+    <h1>IP / HWID Block System</h1>
+    <div class="card">
+      <h2>Create a ban</h2>
+      <form method="post" action="{{ url_for('create_ban') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="row">
+          <div><label>Type</label><select name="ban_type"><option>IP</option><option>HWID</option></select></div>
+          <div><label>Address / HWID</label><input name="value" required maxlength="256"></div>
+          <div><label>Duration</label><select name="duration">
+            <option value="1h">1 hour</option><option value="24h">24 hours</option>
+            <option value="7d">7 days</option><option value="permanent">Permanent</option>
+          </select></div>
+        </div>
+        <label>Reason</label><input name="reason" maxlength="500" placeholder="Reason for blocking">
+        <button class="btn danger">Apply ban</button>
+      </form>
+    </div>
+    <div class="card"><h2>Ban records</h2><div class="table-scroll"><table>
+      <tr><th>Type</th><th>Value</th><th>Reason</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr>
+      {% for r in rows %}
+      <tr><td>{{ r['ban_type'] }}</td><td><code>{{ r['value'] }}</code></td>
+      <td>{{ r['reason'] }}</td><td>{{ r['created_at'] }}</td>
+      <td>{{ r['expires_at'] or 'Permanent' }}</td>
+      <td>{{ 'Active' if r['active'] and (not r['expires_at'] or r['expires_at'] > now) else 'Inactive / Expired' }}</td>
+      <td>{% if r['active'] %}<form method="post" action="{{ url_for('remove_ban', ban_id=r['id']) }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">Unblock</button>
+      </form>{% endif %}</td></tr>
+      {% endfor %}
+    </table></div></div>
+    """
+    return page("Block System", render_template_string(
+        body, rows=rows, csrf=csrf_token(), now=iso(now_utc())
+    ))
+
+
+@app.post("/bans/create")
+@admin_required
+def create_ban():
+    require_csrf()
+    ban_type = request.form.get("ban_type", "").upper()
+    value = request.form.get("value", "").strip()
+    reason = request.form.get("reason", "").strip()[:500]
+    duration = request.form.get("duration", "permanent")
+    if ban_type not in ("IP", "HWID") or not value or len(value) > 256:
+        abort(400, "Invalid ban type or value")
+    expiry = None
+    durations = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}
+    if duration in durations:
+        expiry = iso(now_utc() + durations[duration])
+    elif duration != "permanent":
+        abort(400, "Invalid ban duration")
+    with db() as c:
+        c.execute("""
+            INSERT INTO bans(ban_type,value,reason,created_at,expires_at,active,created_by)
+            VALUES(?,?,?,?,?,1,?)
+        """, (ban_type, value, reason, iso(now_utc()), expiry, ADMIN_USER))
+        if ban_type == "HWID":
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE hwid=?", (value,))
+        elif ban_type == "IP":
+            c.execute("""
+                UPDATE api_sessions SET revoked=1
+                WHERE hwid IN (SELECT hwid FROM device_ips WHERE ip=?)
+            """, (value,))
+    audit("BAN_CREATED", f"type={ban_type} value={value[:80]} duration={duration} reason={reason}")
+    return redirect(url_for("bans_page"))
+
+
+@app.post("/bans/<int:ban_id>/remove")
+@admin_required
+def remove_ban(ban_id):
+    require_csrf()
+    with db() as c:
+        c.execute("UPDATE bans SET active=0 WHERE id=?", (ban_id,))
+    audit("BAN_REMOVED", f"ban_id={ban_id}")
+    return redirect(url_for("bans_page"))
+
+
+@app.get("/sessions")
+@admin_required
+def sessions_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT s.id,s.hwid,s.created_at,s.expires_at,s.last_seen,s.revoked,k.key
+            FROM api_sessions s JOIN keys k ON k.id=s.key_id
+            ORDER BY s.id DESC LIMIT 500
+        """).fetchall()
+    body = """
+    <h1>API Sessions</h1><div class="card"><div class="table-scroll"><table>
+      <tr><th>Key</th><th>HWID</th><th>Created</th><th>Last seen</th><th>Expires</th><th>Status</th><th>Action</th></tr>
+      {% for r in rows %}<tr><td><code>{{ r['key'] }}</code></td><td><code>{{ r['hwid'] }}</code></td>
+      <td>{{ r['created_at'] }}</td><td>{{ r['last_seen'] }}</td><td>{{ r['expires_at'] }}</td>
+      <td>{{ 'Revoked' if r['revoked'] else 'Active / may expire' }}</td><td>
+      {% if not r['revoked'] %}<form method="post" action="{{ url_for('revoke_session', session_id=r['id']) }}">
+      <input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn danger">Revoke</button></form>{% endif %}
+      </td></tr>{% endfor %}
+    </table></div></div>
+    """
+    return page("Sessions", render_template_string(body, rows=rows, csrf=csrf_token()))
+
+
+@app.post("/sessions/<int:session_id>/revoke")
+@admin_required
+def revoke_session(session_id):
+    require_csrf()
+    with db() as c:
+        c.execute("UPDATE api_sessions SET revoked=1 WHERE id=?", (session_id,))
+    audit("SESSION_REVOKED", f"session_id={session_id}")
+    return redirect(url_for("sessions_page"))
+
+
+@app.get("/export/devices.csv")
+@admin_required
+def export_devices():
+    import csv
+    import io
+    with db() as c:
+        rows = c.execute("""
+            SELECT k.key,d.hwid,d.first_seen,d.last_seen,d.last_ip,
+                   COALESCE((SELECT GROUP_CONCAT(ip, ';') FROM device_ips x
+                     WHERE x.key_id=d.key_id AND x.hwid=d.hwid),'') AS all_ips
+            FROM devices d JOIN keys k ON k.id=d.key_id
+            ORDER BY d.last_seen DESC
+        """).fetchall()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["key", "hwid", "first_seen", "last_seen", "last_ip", "all_ips"])
+    for row in rows:
+        writer.writerow([row["key"], row["hwid"], row["first_seen"],
+                         row["last_seen"], row["last_ip"], row["all_ips"]])
+    response = make_response("\\ufeff" + output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = "attachment; filename=devices.csv"
+    audit("DEVICES_EXPORTED", f"rows={len(rows)}")
+    return response
+
+
+@app.get("/backup")
+@admin_required
+def backup_database():
+    import tempfile
+    from flask import send_file
+    fd, path = tempfile.mkstemp(prefix="server-backup-", suffix=".db")
+    os.close(fd)
+    try:
+        with sqlite3.connect(path) as target:
+            with db() as origin:
+                origin.backup(target)
+        audit("DATABASE_BACKUP", "database backup downloaded")
+        response = send_file(path, as_attachment=True, download_name="server-backup.db",
+                             mimetype="application/octet-stream")
+        response.call_on_close(lambda: os.path.exists(path) and os.remove(path))
+        return response
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
+
+
+# ============================================================
+# SECURITY HEADERS / ERROR RESPONSES
+# ============================================================
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https://media.tenor.com;"
+    )
+    return response
+
+
+@app.errorhandler(400)
+def bad_request(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": str(e)}), 400
+    message = str(e)
+    if "Invalid CSRF token" in message:
+        return render_template_string(BASE_STYLE + """
+        <div class="wrap login-shell"><div class="card login-card">
+          <h1>Session expired</h1>
+          <p class="small">The security token for this page is no longer valid. Reload the panel and try again.</p>
+          <a class="btn primary" href="{{ url_for('keys_page') }}">Reload Keys</a>
+        </div></div>
+        """), 400
+    return message, 400
+
+
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return "Not found", 404
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+init_db()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8080"))
+    # Host must be 0.0.0.0 for Railway/Render/etc.
+    app.run(host="0.0.0.0", port=port, debug=False)
