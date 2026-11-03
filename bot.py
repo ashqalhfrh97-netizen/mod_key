@@ -24,7 +24,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 #
 # Environment variables:
 #   ADMIN_USER=your_admin_username
-#   ADMIN_PASS=your_strong_admin_password
+#   ADMIN_PASS=your_strong_admin_password (or ADMIN_PASSWORD_HASH)
 #   SECRET_KEY=a_long_random_secret
 #   PORT=8080
 #
@@ -32,6 +32,8 @@ from werkzeug.security import generate_password_hash, check_password_hash
 #   DB_PATH=modpanel.db
 #   SESSION_HOURS=12
 #   API_SESSION_MINUTES=30
+#   ANIME_GIF_URL=https://your-host/path/background.gif (optional)
+#   TRUST_PROXY_HEADERS=1 only behind a trusted reverse proxy
 #
 # IMPORTANT:
 # - The server is the source of truth for keys/expiry/permissions.
@@ -43,22 +45,27 @@ app = Flask(__name__)
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011")
-SECRET_KEY = os.environ.get("SECRET_KEY", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1")
+ADMIN_PASSWORD_HASH = os.environ.get("ADMIN_PASSWORD_HASH", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc")
 
-if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
+if not ADMIN_USER or not (ADMIN_PASS or ADMIN_PASSWORD_HASH) or len(SECRET_KEY) < 32:
     raise RuntimeError(
-        "Set ADMIN_USER, ADMIN_PASS and SECRET_KEY environment variables "
-        "before starting the server."
+        "Configure ADMIN_USER, ADMIN_PASS (or ADMIN_PASSWORD_HASH), and "
+        "a SECRET_KEY of at least 32 characters in the deployment environment."
     )
 
 app.secret_key = SECRET_KEY
 
 # Full-page animated background GIF. You can replace this URL later
 # without changing the rest of the application.
-ANIME_GIF_URL = os.environ.get(
-    "ANIME_GIF_URL",
-    "https://media.tenor.com/images/7f3d3c7c7e5f4f7d8e7f7c6c4a0b0d4b/tenor.gif"
-).strip()
+ANIME_GIF_URL = os.environ.get("ANIME_GIF_URL", "https://tenor.com/view/david-martinez-cyberpunk-edgerunners-cyberpunk-gif-11167589060371146665").strip()
+if ANIME_GIF_URL:
+    _gif_url_parts = urlparse(ANIME_GIF_URL)
+    if not (
+        (_gif_url_parts.scheme == "https" and _gif_url_parts.netloc)
+        or ANIME_GIF_URL.startswith("/static/")
+    ):
+        raise RuntimeError("ANIME_GIF_URL must be an HTTPS URL or a /static/ path.")
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SECURE=True,       # HTTPS in production
@@ -179,6 +186,28 @@ def init_db():
             FOREIGN KEY(key_id) REFERENCES keys(id) ON DELETE CASCADE,
             FOREIGN KEY(feature_id) REFERENCES feature_permissions(feature_id) ON DELETE CASCADE
         );
+
+        CREATE TABLE IF NOT EXISTS rate_limit_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bucket TEXT NOT NULL,
+            client_ip TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rate_limit_lookup
+            ON rate_limit_events(bucket, client_ip, created_at);
+
+        CREATE TABLE IF NOT EXISTS security_blocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            block_type TEXT NOT NULL CHECK(block_type IN ('ip','hwid')),
+            subject TEXT NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT 'admin',
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_security_blocks_lookup
+            ON security_blocks(block_type, subject, active, expires_at);
         """)
 
         defaults = {
@@ -273,29 +302,42 @@ def set_setting(name, value):
 # ============================================================
 
 def rate_limit(bucket, limit, window_seconds):
+    """Persistent sliding-window limiter shared by workers using the same SQLite DB."""
+    client_ip = current_client_ip() or "unknown"
     now = time.time()
-    ip = request.remote_addr or "unknown"
-    key = f"{bucket}:{ip}"
-
-    values = RATE_BUCKETS.get(key, [])
-    values = [x for x in values if now - x < window_seconds]
-
-    if len(values) >= limit:
-        RATE_BUCKETS[key] = values
+    cutoff = now - int(window_seconds)
+    try:
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("DELETE FROM rate_limit_events WHERE created_at < ?", (now - 86400,))
+            count = c.execute("""
+                SELECT COUNT(*) FROM rate_limit_events
+                WHERE bucket=? AND client_ip=? AND created_at>=?
+            """, (bucket, client_ip, cutoff)).fetchone()[0]
+            if count >= int(limit):
+                c.commit()
+                return False
+            c.execute("""
+                INSERT INTO rate_limit_events(bucket,client_ip,created_at)
+                VALUES(?,?,?)
+            """, (bucket, client_ip, now))
+            c.commit()
+            return True
+    except sqlite3.Error:
+        app.logger.exception("Rate limiter database error")
         return False
 
-    values.append(now)
-    RATE_BUCKETS[key] = values
 
-    # Prevent this tiny dict from growing forever.
-    if len(RATE_BUCKETS) > 5000:
-        cutoff = now - 3600
-        for k in list(RATE_BUCKETS):
-            RATE_BUCKETS[k] = [x for x in RATE_BUCKETS[k] if x >= cutoff]
-            if not RATE_BUCKETS[k]:
-                RATE_BUCKETS.pop(k, None)
-
-    return True
+def is_security_blocked(block_type, subject):
+    if not subject:
+        return False
+    with db() as c:
+        row = c.execute("""
+            SELECT id FROM security_blocks
+            WHERE block_type=? AND subject=? AND active=1 AND expires_at>?
+            ORDER BY id DESC LIMIT 1
+        """, (block_type, str(subject)[:256], iso(now_utc()))).fetchone()
+    return row is not None
 
 
 # ============================================================
@@ -358,7 +400,15 @@ def hash_token(token):
 
 
 def current_client_ip():
-    return request.headers.get("X-Forwarded-For", request.remote_addr or "")
+    # Forwarded headers are trusted only behind an explicitly configured proxy.
+    remote = request.remote_addr or ""
+    if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1":
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            candidate = forwarded.split(",", 1)[0].strip()
+            if candidate and len(candidate) <= 64:
+                return candidate
+    return remote
 
 
 # ============================================================
@@ -499,6 +549,9 @@ def api_health():
 
 @app.post("/api/v1/auth/login")
 def api_login():
+    client_ip = current_client_ip()
+    if is_security_blocked("ip", client_ip):
+        return jsonify({"success": False, "message": "Access temporarily blocked"}), 403
     if not rate_limit("api_login", 12, 60):
         return jsonify({
             "success": False,
@@ -512,6 +565,9 @@ def api_login():
 
     if len(hwid) > 256:
         return jsonify({"success": False, "message": "Invalid device id"}), 400
+    if is_security_blocked("hwid", hwid):
+        audit("BLOCKED_DEVICE_LOGIN", f"hwid={hwid[:16]}...", client_ip)
+        return jsonify({"success": False, "message": "Device temporarily blocked"}), 403
 
     key_row, device, error = valid_key_for_device(key_value, hwid, True)
 
@@ -609,6 +665,11 @@ def require_api_session():
         if not row:
             return None, "Invalid session"
 
+        if (is_security_blocked("ip", current_client_ip())
+                or is_security_blocked("hwid", row["hwid"])):
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE id=?", (row["id"],))
+            return None, "Access temporarily blocked"
+
         session_exp = parse_iso(row["expires_at"])
         key_exp = parse_iso(row["key_expires_at"])
 
@@ -698,11 +759,11 @@ def api_logout():
 
 BASE_STYLE = """
 <style>
-:root{--bg:#070b12;--panel:#101927;--line:#26364d;--text:#eef5ff;--muted:#8fa2bb;--blue:#3b82f6;--green:#34d399;--red:#fb7185}
+:root{--bg:#070914;--panel:#101426;--line:#30324f;--text:#f3f4ff;--muted:#a2a8c4;--blue:#8b5cf6;--green:#34d399;--red:#fb7185}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
 html{min-height:100%;background:#050812}
 body{margin:0;background:#050812;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
-body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.40;filter:saturate(1.18) contrast(1.08);pointer-events:none}
+body::before{content:"";position:fixed;inset:0;z-index:0;background-image:{% if anime_gif_url %}url("{{ anime_gif_url }}"){% else %}radial-gradient(circle at 18% 20%,rgba(99,102,241,.22),transparent 38%),radial-gradient(circle at 82% 75%,rgba(14,165,233,.18),transparent 40%){% endif %};background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.40;filter:saturate(1.18) contrast(1.08);pointer-events:none}
 body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(180deg,rgba(3,6,15,.48),rgba(3,6,15,.72));pointer-events:none}
 
 a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
@@ -710,7 +771,7 @@ a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
 .topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;padding:14px 16px;background:rgba(16,25,39,.9);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;position:sticky;top:12px;z-index:20;box-shadow:0 18px 55px rgba(0,0,0,.3)}
 .brand{display:flex;align-items:center;gap:11px;font-weight:800}.brand-dot{width:11px;height:11px;border-radius:50%;background:var(--green);box-shadow:0 0 18px rgba(52,211,153,.75)}
 .nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#172337;color:#eaf2ff;border:1px solid #2c3e57;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#4d6b94;background:#1c2c44}
-.btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.btn.danger{background:#65152b;border-color:#a83b59}
+.btn.primary{background:linear-gradient(135deg,#6d28d9,#2563eb);border-color:#8b5cf6}.btn.danger{background:#65152b;border-color:#a83b59}
 .hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
 .card{background:linear-gradient(180deg,rgba(18,29,45,.97),rgba(12,20,32,.97));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
 h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}.stat{font-size:30px;font-weight:850;margin-top:5px}.small{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
@@ -732,6 +793,7 @@ def page(title, body):
               <a href="{{ url_for('dashboard') }}">Dashboard</a>
               <a href="{{ url_for('keys_page') }}">Keys</a>
               <a href="{{ url_for('devices_page') }}">Devices</a>
+              <a href="{{ url_for('security_page') }}">Security</a>
               <a href="{{ url_for('features_page') }}">Permissions</a>
               <a href="{{ url_for('settings_page') }}">Settings</a>
               <a href="{{ url_for('logs_page') }}">Logs</a>
@@ -787,7 +849,16 @@ def login_post():
     username = request.form.get("username", "")
     password = request.form.get("password", "")
 
-    if hmac.compare_digest(username, ADMIN_USER) and hmac.compare_digest(password, ADMIN_PASS):
+    password_ok = False
+    if ADMIN_PASSWORD_HASH:
+        try:
+            password_ok = check_password_hash(ADMIN_PASSWORD_HASH, password)
+        except (ValueError, TypeError):
+            password_ok = False
+    elif ADMIN_PASS:
+        password_ok = hmac.compare_digest(password, ADMIN_PASS)
+
+    if hmac.compare_digest(username, ADMIN_USER) and password_ok:
         session.clear()
         session.permanent = True
         session["admin"] = True
@@ -1122,6 +1193,129 @@ def delete_device(device_id):
     return redirect(url_for("devices_page"))
 
 
+@app.get("/security")
+@admin_required
+def security_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM security_blocks
+            WHERE active=1 AND expires_at>?
+            ORDER BY id DESC LIMIT 300
+        """, (iso(now_utc()),)).fetchall()
+        recent_limits = c.execute("""
+            SELECT bucket, client_ip, COUNT(*) AS hits, MAX(created_at) AS last_hit
+            FROM rate_limit_events
+            WHERE created_at>=?
+            GROUP BY bucket, client_ip
+            ORDER BY hits DESC LIMIT 30
+        """, (time.time() - 3600,)).fetchall()
+
+    body = """
+    <h1>Security Center</h1>
+    <div class="card">
+      <h2>Temporary block</h2>
+      <p class="small">Block an IP address or device ID. Use a short duration and a clear reason.</p>
+      <form method="post" action="{{ url_for('security_block_create') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="row">
+          <div><label>Type</label>
+            <select name="block_type" required>
+              <option value="ip">IP address</option>
+              <option value="hwid">Device HWID</option>
+            </select>
+          </div>
+          <div><label>Duration (minutes)</label>
+            <input type="number" name="duration" min="1" max="43200" value="60" required>
+          </div>
+        </div>
+        <label>IP / HWID</label>
+        <input name="subject" maxlength="256" required>
+        <label>Reason</label>
+        <input name="reason" maxlength="250" placeholder="Repeated failed login attempts">
+        <button class="btn danger" type="submit">Create temporary block</button>
+      </form>
+    </div>
+    <div class="card">
+      <h2>Active blocks</h2>
+      <table>
+        <tr><th>Type</th><th>Subject</th><th>Reason</th><th>Created</th><th>Expires</th><th>Action</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['block_type'] }}</td><td><code>{{ r['subject'] }}</code></td>
+          <td>{{ r['reason'] }}</td><td>{{ r['created_at'] }}</td><td>{{ r['expires_at'] }}</td>
+          <td><form method="post" action="{{ url_for('security_block_remove', block_id=r['id']) }}">
+            <input type="hidden" name="csrf" value="{{ csrf }}">
+            <button class="btn primary">Unblock</button>
+          </form></td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="small">No active blocks.</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+    <div class="card">
+      <h2>Rate-limit activity (last hour)</h2>
+      <table>
+        <tr><th>Bucket</th><th>IP</th><th>Hits</th><th>Last hit (UTC epoch)</th></tr>
+        {% for r in recent_limits %}
+        <tr><td>{{ r['bucket'] }}</td><td>{{ r['client_ip'] }}</td><td>{{ r['hits'] }}</td><td>{{ r['last_hit'] }}</td></tr>
+        {% else %}
+        <tr><td colspan="4" class="small">No recent rate-limit events.</td></tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("Security", render_template_string(
+        body, rows=rows, recent_limits=recent_limits, csrf=csrf_token()
+    ))
+
+
+@app.post("/security/blocks")
+@admin_required
+def security_block_create():
+    require_csrf()
+    block_type = request.form.get("block_type", "").strip()
+    subject = request.form.get("subject", "").strip()
+    reason = request.form.get("reason", "").strip()[:250]
+    try:
+        duration = int(request.form.get("duration", "60"))
+    except (TypeError, ValueError):
+        abort(400, "Invalid block duration")
+
+    if block_type not in ("ip", "hwid") or not subject or len(subject) > 256:
+        abort(400, "Invalid block target")
+    if duration < 1 or duration > 43200:
+        abort(400, "Block duration must be between 1 and 43200 minutes")
+
+    created = now_utc()
+    expires = created + timedelta(minutes=duration)
+    with db() as c:
+        c.execute("""
+            INSERT INTO security_blocks
+            (block_type,subject,reason,created_at,expires_at,created_by,active)
+            VALUES(?,?,?,?,?,?,1)
+        """, (block_type, subject, reason, iso(created), iso(expires), ADMIN_USER))
+        if block_type == "hwid":
+            c.execute(
+                "UPDATE api_sessions SET revoked=1 WHERE hwid=? AND revoked=0",
+                (subject,)
+            )
+
+    audit("SECURITY_BLOCK_CREATED",
+          f"type={block_type} subject={subject[:32]} duration={duration}m reason={reason}")
+    return redirect(url_for("security_page"))
+
+
+@app.post("/security/blocks/<int:block_id>/remove")
+@admin_required
+def security_block_remove(block_id):
+    require_csrf()
+    with db() as c:
+        c.execute("UPDATE security_blocks SET active=0 WHERE id=?", (block_id,))
+    audit("SECURITY_BLOCK_REMOVED", f"block_id={block_id}")
+    return redirect(url_for("security_page"))
+
+
 @app.get("/features")
 @admin_required
 def features_page():
@@ -1213,180 +1407,4 @@ def settings_page():
         </select>
 
         <label>Maintenance</label>
-        <select name="maintenance">
-          <option value="0" {{ 'selected' if not maintenance else '' }}>OFF</option>
-          <option value="1" {{ 'selected' if maintenance else '' }}>ON</option>
-        </select>
-
-        <label>Menu Version</label>
-        <input name="menu_version" value="{{ version }}">
-
-        <label>Minimum Client Version</label>
-        <input name="min_client_version" value="{{ minver }}">
-
-        <label>Announcement</label>
-        <textarea name="announcement" rows="4">{{ announcement }}</textarea>
-
-        <button class="btn primary">Save Settings</button>
-      </form>
-    </div>
-    """
-    return page("Settings", render_template_string(
-        body,
-        menu_enabled=get_setting("menu_enabled") == "1",
-        maintenance=get_setting("maintenance") == "1",
-        version=get_setting("menu_version", "1.0.0"),
-        minver=get_setting("min_client_version", "1.0.0"),
-        announcement=get_setting("announcement", ""),
-        csrf=csrf_token()
-    ))
-
-
-@app.post("/settings")
-@admin_required
-def settings_save():
-    require_csrf()
-
-    set_setting("menu_enabled", "1" if request.form.get("menu_enabled") == "1" else "0")
-    set_setting("maintenance", "1" if request.form.get("maintenance") == "1" else "0")
-    set_setting("menu_version", request.form.get("menu_version", "1.0.0")[:50])
-    set_setting("min_client_version", request.form.get("min_client_version", "1.0.0")[:50])
-    set_setting("announcement", request.form.get("announcement", "")[:2000])
-
-    # Kill switch: immediately revoke all sessions.
-    if get_setting("menu_enabled") != "1" or get_setting("maintenance") == "1":
-        with db() as c:
-            c.execute("UPDATE api_sessions SET revoked=1 WHERE revoked=0")
-
-    audit("SETTINGS_UPDATED", "server settings changed")
-    return redirect(url_for("settings_page"))
-
-
-@app.get("/login-activity")
-@admin_required
-def login_activity_page():
-    with db() as c:
-        rows = c.execute("""
-            SELECT created_at,event,ip,details
-            FROM audit_logs
-            WHERE event IN (
-                'API_LOGIN_OK',
-                'API_LOGIN_FAILED',
-                'ADMIN_LOGIN',
-                'ADMIN_LOGIN_FAILED'
-            )
-            ORDER BY id DESC
-            LIMIT 500
-        """).fetchall()
-
-    body = """
-    <h1>Login Activity</h1>
-    <div class="card">
-      <p class="small">
-        Successful and failed login attempts with IP, masked key,
-        HWID prefix and client version.
-      </p>
-      <div class="table-scroll">
-      <table>
-        <tr><th>Time</th><th>Result</th><th>IP</th><th>Details</th></tr>
-        {% for r in rows %}
-        <tr>
-          <td>{{ r['created_at'] }}</td>
-          <td>
-            {% if r['event'] in ['API_LOGIN_OK','ADMIN_LOGIN'] %}
-              <span class="ok">{{ r['event'] }}</span>
-            {% else %}
-              <span class="bad">{{ r['event'] }}</span>
-            {% endif %}
-          </td>
-          <td><code>{{ r['ip'] or 'unknown' }}</code></td>
-          <td>{{ r['details'] }}</td>
-        </tr>
-        {% endfor %}
-      </table>
-      </div>
-    </div>
-    """
-    return page("Login Activity", render_template_string(body, rows=rows))
-
-
-@app.get("/logs")
-@admin_required
-def logs_page():
-    with db() as c:
-        rows = c.execute("""
-            SELECT * FROM audit_logs
-            ORDER BY id DESC LIMIT 300
-        """).fetchall()
-
-    body = """
-    <h1>Audit Logs</h1>
-    <div class="card">
-      <table>
-        <tr><th>Time</th><th>Event</th><th>IP</th><th>Details</th></tr>
-        {% for r in rows %}
-        <tr>
-          <td>{{ r['created_at'] }}</td>
-          <td>{{ r['event'] }}</td>
-          <td>{{ r['ip'] }}</td>
-          <td>{{ r['details'] }}</td>
-        </tr>
-        {% endfor %}
-      </table>
-    </div>
-    """
-    return page("Logs", render_template_string(body, rows=rows, csrf=csrf_token()))
-
-
-# ============================================================
-# SECURITY HEADERS / ERROR RESPONSES
-# ============================================================
-
-@app.after_request
-def security_headers(response):
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; "
-        "style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data: https://media.tenor.com;"
-    )
-    return response
-
-
-@app.errorhandler(400)
-def bad_request(e):
-    if request.path.startswith("/api/"):
-        return jsonify({"success": False, "message": str(e)}), 400
-    message = str(e)
-    if "Invalid CSRF token" in message:
-        return render_template_string(BASE_STYLE + """
-        <div class="wrap login-shell"><div class="card login-card">
-          <h1>Session expired</h1>
-          <p class="small">The security token for this page is no longer valid. Reload the panel and try again.</p>
-          <a class="btn primary" href="{{ url_for('keys_page') }}">Reload Keys</a>
-        </div></div>
-        """), 400
-    return message, 400
-
-
-@app.errorhandler(404)
-def not_found(e):
-    if request.path.startswith("/api/"):
-        return jsonify({"success": False, "message": "Not found"}), 404
-    return "Not found", 404
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-init_db()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    # Host must be 0.0.0.0 for Railway/Render/etc.
-    app.run(host="0.0.0.0", port=port, debug=False)
+        <select name="main
