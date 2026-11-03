@@ -46,7 +46,7 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "@X50ASD").strip()
 # The fallback values keep older deployments bootable, but MUST be rotated
 # before public use because source-code defaults are not secret.
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "basar2011").strip()
-SECRET_KEY = os.environ.get("SECRET_KEY", "8959881524:AAHJKmUz59xbPicuodo-W6prLRg-lJDnbyc").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "EU-HUD1-A4vDR8T9KSFTrZ1g-0-1").strip()
 
 if not ADMIN_USER or not ADMIN_PASS or not SECRET_KEY:
     raise RuntimeError(
@@ -212,6 +212,12 @@ def init_db():
         }
         if "last_ip" not in device_columns:
             c.execute("ALTER TABLE devices ADD COLUMN last_ip TEXT DEFAULT ''")
+
+        key_columns = {row["name"] for row in c.execute("PRAGMA table_info(keys)").fetchall()}
+        if "is_paused" not in key_columns:
+            c.execute("ALTER TABLE keys ADD COLUMN is_paused INTEGER NOT NULL DEFAULT 0")
+        if "paused_remaining" not in key_columns:
+            c.execute("ALTER TABLE keys ADD COLUMN paused_remaining INTEGER")
 
         c.execute("CREATE INDEX IF NOT EXISTS idx_device_ips_ip ON device_ips(ip)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_bans_lookup ON bans(ban_type,value,active)")
@@ -469,6 +475,8 @@ def key_status(row):
         return "NOT_FOUND"
     if not row["active"]:
         return "DISABLED"
+    if "is_paused" in row.keys() and row["is_paused"]:
+        return "PAUSED"
     exp = parse_iso(row["expires_at"])
     if exp and exp <= now_utc():
         return "EXPIRED"
@@ -686,6 +694,7 @@ def require_api_session():
                 k.key,
                 k.active,
                 k.device_limit,
+                k.is_paused AS key_is_paused,
                 k.expires_at AS key_expires_at
             FROM api_sessions s
             JOIN keys k ON k.id=s.key_id
@@ -989,116 +998,98 @@ def keys_page():
         """).fetchall()
 
     body = """
-    <h1>Keys</h1>
+    <div class="keys-head">
+      <div><h1 data-en="Keys" data-ar="المفاتيح">Keys</h1>
+      <p class="small" data-en="Create and manage activation keys" data-ar="إنشاء مفاتيح التفعيل وإدارتها">Create and manage activation keys</p></div>
+      <button type="button" class="btn" onclick="toggleLanguage()" id="languageBtn">العربية</button>
+    </div>
+
+    <div class="keys-banner">
+      <img src="{{ anime_gif_url }}" alt="Animated banner" loading="lazy">
+      <div><strong data-en="Key Control Center" data-ar="مركز إدارة المفاتيح">Key Control Center</strong>
+      <p data-en="Manage devices, validity and access from one place." data-ar="تحكم بالأجهزة والصلاحية والوصول من مكان واحد.">Manage devices, validity and access from one place.</p></div>
+    </div>
 
     {% if created_key %}
     <div class="card created-key-card">
-      <div class="small">NEW ACTIVATION KEY</div>
+      <div class="small" data-en="NEW ACTIVATION KEY" data-ar="مفتاح التفعيل الجديد">NEW ACTIVATION KEY</div>
       <div class="created-key-row">
         <code id="newKey">{{ created_key }}</code>
-        <button type="button" class="btn primary" onclick="copyNewKey()">نسخ</button>
+        <button type="button" class="btn primary" data-key="{{ created_key }}" onclick="copyText(this.dataset.key, this)" data-en="Copy key" data-ar="نسخ المفتاح">Copy key</button>
       </div>
-      <div id="copyStatus" class="small">The new key is ready to copy.</div>
+      <div class="small" data-en="Save this key somewhere safe." data-ar="احفظ المفتاح في مكان آمن.">Save this key somewhere safe.</div>
     </div>
     {% endif %}
 
     <div class="card">
-      <h2>Create Key</h2>
+      <h2 data-en="Create a key" data-ar="إنشاء مفتاح">Create a key</h2>
       <form method="post" action="{{ url_for('create_key') }}">
         <input type="hidden" name="csrf" value="{{ csrf }}">
         <div class="row">
-          <div>
-            <label>Custom key (optional)</label>
-            <input name="key" placeholder="AK-XXXX-XXXX-XXXX">
-          </div>
-          <div>
-            <label>Device limit</label>
-            <input type="number" name="device_limit" min="1" max="100" value="1">
-          </div>
-          <div>
-            <label>Days (0 = permanent)</label>
-            <input type="number" name="days" min="0" value="30">
-          </div>
+          <div><label data-en="Custom key (optional)" data-ar="مفتاح مخصص (اختياري)">Custom key (optional)</label><input name="key" placeholder="AK-XXXX-XXXX-XXXX"></div>
+          <div><label data-en="Allowed devices" data-ar="عدد الأجهزة المسموح بها">Allowed devices</label><input type="number" name="device_limit" min="1" max="100" value="1"></div>
+          <div><label data-en="Validity in days (0 = unlimited)" data-ar="الصلاحية بالأيام (0 = دائم)">Validity in days (0 = unlimited)</label><input type="number" name="days" min="0" value="30"></div>
         </div>
-        <input name="note" placeholder="Note">
-        <button class="btn primary">Create</button>
+        <label data-en="Note" data-ar="ملاحظة">Note</label><input name="note" placeholder="Optional note">
+        <button class="btn primary" data-en="Create key" data-ar="إنشاء المفتاح">Create key</button>
       </form>
     </div>
 
     <div class="card">
-      <table>
-        <tr>
-          <th>Key</th><th>Status</th><th>Devices</th>
-          <th>Expiration</th><th>Actions</th>
-        </tr>
+      <h2 data-en="Your keys" data-ar="المفاتيح الحالية">Your keys</h2>
+      <div class="table-wrap"><table>
+        <tr><th data-en="Key" data-ar="المفتاح">Key</th><th data-en="Status" data-ar="الحالة">Status</th><th data-en="Devices" data-ar="الأجهزة">Devices</th><th data-en="Expiration" data-ar="الانتهاء">Expiration</th><th data-en="Actions" data-ar="الإجراءات">Actions</th></tr>
         {% for r in rows %}
         <tr>
-          <td><code>{{ r['key'] }}</code><br><span class="small">{{ r['note'] }}</span></td>
-          <td>{{ status(r) }}</td>
+          <td><code>{{ r['key'] }}</code><br><span class="small">{{ r['note'] }}</span><br>
+            <button type="button" class="btn tiny" data-key="{{ r['key'] }}" onclick="copyText(this.dataset.key, this)" data-en="Copy" data-ar="نسخ">Copy</button></td>
+          <td><span class="badge {{ 'ok' if status(r)=='ACTIVE' else 'bad' if status(r) in ['DISABLED','EXPIRED'] else '' }}" data-status="{{ status(r) }}" data-en="{{ {'ACTIVE':'Active','PAUSED':'Paused','DISABLED':'Disabled','EXPIRED':'Expired'}.get(status(r), status(r)) }}" data-ar="{{ {'ACTIVE':'نشط','PAUSED':'متوقف مؤقتاً','DISABLED':'معطل','EXPIRED':'منتهي'}.get(status(r), status(r)) }}">{{ {'ACTIVE':'Active','PAUSED':'Paused','DISABLED':'Disabled','EXPIRED':'Expired'}.get(status(r), status(r)) }}</span></td>
           <td>{{ r['device_count'] }}/{{ r['device_limit'] }}</td>
-          <td>
-            {% if r['expires_at'] %}
-              <span class="countdown" data-exp="{{ r['expires_at'] }}">calculating...</span>
-              <br><span class="small">{{ r['expires_at'] }}</span>
-            {% else %}Permanent{% endif %}
-          </td>
-          <td>
-            <form class="inline" method="post" action="{{ url_for('toggle_key', key_id=r['id']) }}">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <button class="btn">{{ 'Disable' if r['active'] else 'Enable' }}</button>
-            </form>
-            <form class="inline" method="post" action="{{ url_for('delete_key', key_id=r['id']) }}"
-                  onsubmit="return confirm('Delete this key and its devices/sessions?')">
-              <input type="hidden" name="csrf" value="{{ csrf }}">
-              <button class="btn danger">Delete</button>
-            </form>
+          <td>{% if r['is_paused'] %}<span class="badge" data-en="Timer paused" data-ar="الوقت متوقف">Timer paused</span>
+              {% elif r['expires_at'] %}<span class="countdown" data-exp="{{ r['expires_at'] }}">...</span><br><span class="small">{{ r['expires_at'] }}</span>
+              {% else %}<span data-en="Unlimited" data-ar="دائم">Unlimited</span>{% endif %}</td>
+          <td class="actions-cell">
+            <form class="inline" method="post" action="{{ url_for('toggle_key', key_id=r['id']) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn tiny" data-en="{{ 'Disable' if r['active'] else 'Enable' }}" data-ar="{{ 'تعطيل' if r['active'] else 'تفعيل' }}">{{ 'Disable' if r['active'] else 'Enable' }}</button></form>
+            {% if r['expires_at'] or r['is_paused'] %}
+            <form class="inline" method="post" action="{{ url_for('pause_key_timer', key_id=r['id']) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn tiny" data-en="{{ 'Resume time' if r['is_paused'] else 'Pause time' }}" data-ar="{{ 'استئناف الوقت' if r['is_paused'] else 'إيقاف الوقت' }}">{{ 'Resume time' if r['is_paused'] else 'Pause time' }}</button></form>
+            <form class="inline" method="post" action="{{ url_for('extend_key', key_id=r['id']) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input class="mini-input" type="number" name="days" min="1" max="3650" value="7" aria-label="Days"><button class="btn tiny" data-en="Add days" data-ar="زيادة الأيام">Add days</button></form>
+            {% endif %}
+            <form class="inline" method="post" action="{{ url_for('update_key_devices', key_id=r['id']) }}"><input type="hidden" name="csrf" value="{{ csrf }}"><input class="mini-input" type="number" name="device_limit" min="1" max="100" value="{{ r['device_limit'] }}" aria-label="Device limit"><button class="btn tiny" data-en="Save devices" data-ar="حفظ الأجهزة">Save devices</button></form>
+            <form class="inline" method="post" action="{{ url_for('delete_key', key_id=r['id']) }}" onsubmit="return confirm('Delete this key and its devices/sessions?')"><input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn danger tiny" data-en="Delete" data-ar="حذف">Delete</button></form>
           </td>
         </tr>
-        {% endfor %}
-      </table>
+        {% else %}<tr><td colspan="5" class="small" data-en="No keys created yet." data-ar="لا توجد مفاتيح حالياً.">No keys created yet.</td></tr>{% endfor %}
+      </table></div>
     </div>
 
+    <style>
+      .keys-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+      .keys-head h1{margin:0}.keys-banner{display:flex;align-items:center;gap:18px;overflow:hidden;border:1px solid var(--line);border-radius:17px;background:rgba(12,20,32,.94);margin-bottom:16px;min-height:115px}
+      .keys-banner img{width:180px;height:115px;object-fit:cover}.keys-banner strong{font-size:20px}.keys-banner p{color:var(--muted);margin:6px 12px 6px 0}
+      .created-key-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:10px 0}.created-key-row code{font-size:16px}
+      .actions-cell{min-width:270px}.actions-cell form{margin:3px 2px}.tiny{padding:7px 9px;font-size:12px}.mini-input{width:62px!important;padding:7px!important;margin:2px!important}
+      .table-wrap{overflow-x:auto}html[dir="rtl"] body{text-align:right}html[dir="rtl"] .keys-banner{flex-direction:row-reverse}html[dir="rtl"] .keys-banner p{margin:6px 0 6px 12px}
+      @media(max-width:650px){.keys-banner img{width:115px;height:100px}.keys-banner{min-height:100px}.keys-banner strong{font-size:16px}}
+    </style>
     <script>
-    async function copyNewKey(){
-        const el = document.getElementById("newKey");
-        if (!el) return;
-        const value = el.textContent.trim();
-        try {
-            await navigator.clipboard.writeText(value);
-        } catch (e) {
-            const area = document.createElement("textarea");
-            area.value = value;
-            area.style.position = "fixed";
-            area.style.opacity = "0";
-            document.body.appendChild(area);
-            area.focus();
-            area.select();
-            document.execCommand("copy");
-            area.remove();
-        }
-        const btn = document.querySelector('button[onclick="copyNewKey()"]');
-        if (btn) {
-            const old = btn.textContent;
-            btn.textContent = "تم النسخ ✓";
-            setTimeout(() => btn.textContent = old, 1400);
-        }
+    async function copyText(value, btn){
+      try { await navigator.clipboard.writeText(value); }
+      catch(e){ const a=document.createElement('textarea');a.value=value;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.select();document.execCommand('copy');a.remove(); }
+      const old=btn.textContent;btn.textContent=(document.documentElement.lang==='ar'?'تم النسخ ✓':'Copied ✓');setTimeout(()=>btn.textContent=old,1300);
     }
-
-    function countdown(){
-      document.querySelectorAll('[data-exp]').forEach(function(el){
-        const end = new Date(el.dataset.exp).getTime();
-        let sec = Math.max(0, Math.floor((end-Date.now())/1000));
-        const d=Math.floor(sec/86400); sec%=86400;
-        const h=Math.floor(sec/3600); sec%=3600;
-        const m=Math.floor(sec/60); const s=sec%60;
-        el.textContent = d+'d '+h+'h '+m+'m '+s+'s';
-      });
+    function toggleLanguage(){
+      const ar=document.documentElement.lang!=='ar';document.documentElement.lang=ar?'ar':'en';document.documentElement.dir=ar?'rtl':'ltr';
+      document.querySelectorAll('[data-en][data-ar]').forEach(el=>{const v=ar?el.dataset.ar:el.dataset.en;if(v!==undefined)el.textContent=v;});
+      document.getElementById('languageBtn').textContent=ar?'English':'العربية';
+      try{localStorage.setItem('keys_panel_lang',ar?'ar':'en')}catch(e){}
     }
-    countdown(); setInterval(countdown,1000);
+    (function(){let l='en';try{l=localStorage.getItem('keys_panel_lang')||'en'}catch(e){}if(l==='ar')toggleLanguage();})();
+    function countdown(){document.querySelectorAll('[data-exp]').forEach(function(el){const end=new Date(el.dataset.exp).getTime();let sec=Math.max(0,Math.floor((end-Date.now())/1000));const d=Math.floor(sec/86400);sec%=86400;const h=Math.floor(sec/3600);sec%=3600;const m=Math.floor(sec/60);const s=sec%60;el.textContent=d+'d '+h+'h '+m+'m '+s+'s';});}
+    countdown();setInterval(countdown,1000);
     </script>
     """
     return page("Keys", render_template_string(
-        body, rows=rows, status=key_status, csrf=csrf_token()
+        body, rows=rows, status=key_status, csrf=csrf_token(), anime_gif_url=ANIME_GIF_URL
     ))
 
 
@@ -1160,6 +1151,74 @@ def toggle_key(key_id):
             )
 
     audit("KEY_TOGGLED", f"key_id={key_id} active={new_value}")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/devices")
+@admin_required
+def update_key_devices(key_id):
+    require_csrf()
+    try:
+        limit = max(1, min(100, int(request.form.get("device_limit", "1"))))
+    except (TypeError, ValueError):
+        abort(400)
+    with db() as c:
+        row = c.execute("SELECT id FROM keys WHERE id=?", (key_id,)).fetchone()
+        if not row:
+            abort(404)
+        c.execute("UPDATE keys SET device_limit=? WHERE id=?", (limit, key_id))
+    audit("KEY_DEVICE_LIMIT_UPDATED", f"key_id={key_id} limit={limit}")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/extend")
+@admin_required
+def extend_key(key_id):
+    require_csrf()
+    try:
+        days = max(1, min(3650, int(request.form.get("days", "7"))))
+    except (TypeError, ValueError):
+        abort(400)
+    with db() as c:
+        row = c.execute("SELECT * FROM keys WHERE id=?", (key_id,)).fetchone()
+        if not row:
+            abort(404)
+        if row["is_paused"]:
+            remaining = int(row["paused_remaining"] or 0) + days * 86400
+            c.execute("UPDATE keys SET paused_remaining=? WHERE id=?", (remaining, key_id))
+        elif row["expires_at"]:
+            old_exp = parse_iso(row["expires_at"])
+            base = old_exp if old_exp and old_exp > now_utc() else now_utc()
+            c.execute("UPDATE keys SET expires_at=? WHERE id=?", (iso(base + timedelta(days=days)), key_id))
+        else:
+            # A permanent key remains permanent; no artificial expiry is added.
+            pass
+    audit("KEY_EXTENDED", f"key_id={key_id} days={days}")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/pause")
+@admin_required
+def pause_key_timer(key_id):
+    require_csrf()
+    with db() as c:
+        row = c.execute("SELECT * FROM keys WHERE id=?", (key_id,)).fetchone()
+        if not row:
+            abort(404)
+        if row["is_paused"]:
+            remaining = max(1, int(row["paused_remaining"] or 0))
+            c.execute("UPDATE keys SET is_paused=0, paused_remaining=NULL, expires_at=? WHERE id=?",
+                      (iso(now_utc() + timedelta(seconds=remaining)), key_id))
+            action = "resumed"
+        elif row["expires_at"]:
+            exp = parse_iso(row["expires_at"])
+            remaining = max(0, int((exp - now_utc()).total_seconds())) if exp else 0
+            c.execute("UPDATE keys SET is_paused=1, paused_remaining=?, expires_at=NULL WHERE id=?",
+                      (remaining, key_id))
+            action = "paused"
+        else:
+            return redirect(url_for("keys_page"))
+    audit("KEY_TIMER_" + action.upper(), f"key_id={key_id}")
     return redirect(url_for("keys_page"))
 
 
