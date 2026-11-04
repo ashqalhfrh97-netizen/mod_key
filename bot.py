@@ -60,7 +60,7 @@ app.secret_key = SECRET_KEY
 # without changing the rest of the application.
 ANIME_GIF_URL = os.environ.get(
     "ANIME_GIF_URL",
-    "https://media.tenor.com/XfrqyR_-jzIAAAAC/anime-goku.gif"
+    "https://media.tenor.com/images/7f3d3c7c7e5f4f7d8e7f7c6c4a0b0d4b/tenor.gif"
 ).strip()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -825,8 +825,8 @@ BASE_STYLE = """
 *{box-sizing:border-box}html{scroll-behavior:smooth}
 html{min-height:100%;background:#100f16}
 body{margin:0;background:#100f16;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
-body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.68;filter:saturate(1.05) contrast(1.08);pointer-events:none}
-body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(135deg,rgba(14,11,20,.34),rgba(18,14,25,.52));pointer-events:none}
+body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.52;filter:saturate(.88) contrast(1.06);pointer-events:none}
+body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(135deg,rgba(14,11,20,.58),rgba(18,14,25,.76));pointer-events:none}
 
 a{color:#d2b6ff;text-decoration:none}a:hover{color:#fff}
 .wrap{max-width:1320px;margin:0 auto;padding:24px 16px 60px;position:relative;z-index:1}
@@ -1217,5 +1217,4 @@ def extend_key(key_id):
             old_exp = parse_iso(row["expires_at"])
             base = old_exp if old_exp and old_exp > now_utc() else now_utc()
             c.execute("UPDATE keys SET expires_at=? WHERE id=?", (iso(base + timedelta(days=days)), key_id))
-        else:
-            # A permanent key remains permanent; no artificial exp
+    # Permanent keys have no expiry, so extending them leaves t
