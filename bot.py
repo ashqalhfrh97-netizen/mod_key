@@ -60,7 +60,7 @@ app.secret_key = SECRET_KEY
 # without changing the rest of the application.
 ANIME_GIF_URL = os.environ.get(
     "ANIME_GIF_URL",
-    "https://media.tenor.com/images/7f3d3c7c7e5f4f7d8e7f7c6c4a0b0d4b/tenor.gif"
+    "https://giphy.com/gifs/hxh-killua-qb1eHxhUHLdsc"
 ).strip()
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
@@ -585,7 +585,6 @@ def api_health():
 @app.post("/api/v1/auth/login")
 def api_login():
     if not rate_limit("api_login", 12, 60):
-        audit("API_LOGIN_RATE_LIMIT", "login rate limit exceeded", current_client_ip())
         return jsonify({
             "success": False,
             "message": "Too many attempts"
@@ -678,10 +677,6 @@ def api_login():
 
 
 def require_api_session():
-    client_ip = current_client_ip()
-    if active_ban("IP", client_ip):
-        return None, "Access temporarily blocked"
-
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None, "Missing authorization"
@@ -707,25 +702,6 @@ def require_api_session():
         """, (token_hash,)).fetchone()
 
         if not row:
-            stamp = iso(now_utc())
-            c.execute(
-                "INSERT INTO audit_logs(created_at,event,ip,details) VALUES(?,?,?,?)",
-                (stamp, "API_INVALID_SESSION", client_ip, "Unknown or revoked bearer token")
-            )
-            since = iso(now_utc() - timedelta(minutes=10))
-            attempts = c.execute("""
-                SELECT COUNT(*) AS n FROM audit_logs
-                WHERE event='API_INVALID_SESSION' AND ip=? AND created_at>=?
-            """, (client_ip, since)).fetchone()["n"]
-            if attempts == 10:
-                expiry = iso(now_utc() + timedelta(minutes=15))
-                c.execute("""
-                    INSERT INTO bans(ban_type,value,reason,created_at,expires_at,active,created_by)
-                    VALUES('IP',?,?,?, ?,1,'security-monitor')
-                """, (client_ip, "10 invalid session tokens within 10 minutes", stamp, expiry))
-                c.execute("""
-                    INSERT INTO audit_logs(created_at,event,ip,details) VALUES(?,?,?,?)
-                """, (stamp, "AUTO_TEMP_IP_BLOCK", client_ip, "15-minute block after repeated invalid session tokens"))
             return None, "Invalid session"
 
         if active_ban("IP", current_client_ip()) or active_ban("HWID", row["hwid"]):
@@ -821,25 +797,25 @@ def api_logout():
 
 BASE_STYLE = """
 <style>
-:root{--bg:#100f16;--panel:#191722;--line:#393342;--text:#f5f0f7;--muted:#b0a6b8;--blue:#a78bfa;--green:#70d6ad;--red:#ff8295;--amber:#e7ad69}
+:root{--bg:#070b12;--panel:#101927;--line:#26364d;--text:#eef5ff;--muted:#8fa2bb;--blue:#3b82f6;--green:#34d399;--red:#fb7185}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
-html{min-height:100%;background:#100f16}
-body{margin:0;background:#100f16;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
-body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.52;filter:saturate(.88) contrast(1.06);pointer-events:none}
-body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(135deg,rgba(14,11,20,.58),rgba(18,14,25,.76));pointer-events:none}
+html{min-height:100%;background:#050812}
+body{margin:0;background:#050812;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.40;filter:saturate(1.18) contrast(1.08);pointer-events:none}
+body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(180deg,rgba(3,6,15,.48),rgba(3,6,15,.72));pointer-events:none}
 
-a{color:#d2b6ff;text-decoration:none}a:hover{color:#fff}
+a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
 .wrap{max-width:1320px;margin:0 auto;padding:24px 16px 60px;position:relative;z-index:1}
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;padding:14px 16px;background:rgba(25,22,34,.88);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;position:sticky;top:12px;z-index:20;box-shadow:0 18px 55px rgba(0,0,0,.3)}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;padding:14px 16px;background:rgba(16,25,39,.9);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;position:sticky;top:12px;z-index:20;box-shadow:0 18px 55px rgba(0,0,0,.3)}
 .brand{display:flex;align-items:center;gap:11px;font-weight:800}.brand-dot{width:11px;height:11px;border-radius:50%;background:var(--green);box-shadow:0 0 18px rgba(52,211,153,.75)}
-.nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#282332;color:#f5eff8;border:1px solid #494052;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#8f76ad;background:#342b3d}
-.btn.primary{background:linear-gradient(135deg,#76569b,#a17bb8);border-color:#b99bd0}.btn.danger{background:#642b3c;border-color:#a65b70}
-.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:rgba(24,20,31,.84);margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
-.card{background:linear-gradient(180deg,rgba(31,27,40,.94),rgba(21,19,29,.96));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
+.nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#172337;color:#eaf2ff;border:1px solid #2c3e57;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#4d6b94;background:#1c2c44}
+.btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.btn.danger{background:#65152b;border-color:#a83b59}
+.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
+.card{background:linear-gradient(180deg,rgba(18,29,45,.97),rgba(12,20,32,.97));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
 h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}.stat{font-size:30px;font-weight:850;margin-top:5px}.small{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
-input,select,textarea{width:100%;padding:11px 12px;margin:6px 0 12px;background:#17141f;color:#f8f2fa;border:1px solid #494052;border-radius:10px;outline:none}input:focus,select:focus,textarea:focus{border-color:#b99bd0;box-shadow:0 0 0 3px rgba(167,139,250,.15)}
-table{width:100%;border-collapse:separate;border-spacing:0}th,td{padding:11px;border-bottom:1px solid #393342;text-align:left;vertical-align:middle}th{color:#c0b5c8;font-size:12px;text-transform:uppercase;letter-spacing:.05em}tr:hover td{background:rgba(167,139,250,.045)}
-.badge{display:inline-flex;padding:4px 9px;border-radius:999px;background:#302a38;border:1px solid #494052}.ok{color:var(--green)}.bad{color:var(--red)}.inline{display:inline}code{color:#e0c8f5;background:#17141f;padding:3px 6px;border-radius:6px}.login-shell{min-height:92vh;display:grid;place-items:center}.login-card{width:min(460px,100%);padding:26px}.footer{text-align:center;color:#93899c;font-size:12px;margin-top:20px}
+input,select,textarea{width:100%;padding:11px 12px;margin:6px 0 12px;background:#09111d;color:#fff;border:1px solid #30435d;border-radius:10px;outline:none}input:focus,select:focus,textarea:focus{border-color:#5b9cff;box-shadow:0 0 0 3px rgba(59,130,246,.15)}
+table{width:100%;border-collapse:separate;border-spacing:0}th,td{padding:11px;border-bottom:1px solid #243247;text-align:left;vertical-align:middle}th{color:#a9bad0;font-size:12px;text-transform:uppercase;letter-spacing:.05em}tr:hover td{background:rgba(59,130,246,.035)}
+.badge{display:inline-flex;padding:4px 9px;border-radius:999px;background:#1c2a3d;border:1px solid #30435d}.ok{color:var(--green)}.bad{color:var(--red)}.inline{display:inline}code{color:#b9d7ff;background:#09111d;padding:3px 6px;border-radius:6px}.login-shell{min-height:92vh;display:grid;place-items:center}.login-card{width:min(460px,100%);padding:26px}.footer{text-align:center;color:#71839a;font-size:12px;margin-top:20px}
 @media(max-width:800px){.topbar{position:static;align-items:flex-start;flex-direction:column}.nav{justify-content:flex-start}.hero-overlay{padding:20px}table{display:block;overflow-x:auto;white-space:nowrap}}
 </style>
 """
@@ -862,7 +838,6 @@ def page(title, body):
               <a href="{{ url_for('settings_page') }}">Settings</a>
               <a href="{{ url_for('logs_page') }}">Logs</a>
             <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
-              <a href="{{ url_for('security_monitor_page') }}">Security Monitor</a>
               <a href="{{ url_for('logout') }}">Logout</a>
             </nav>
           </header>
@@ -905,7 +880,6 @@ def login():
 @app.post("/login")
 def login_post():
     if not rate_limit("admin_login", 8, 60):
-        audit("ADMIN_LOGIN_RATE_LIMIT", "admin login rate limit exceeded", current_client_ip())
         return render_template_string(
             BASE_STYLE + "<div class='wrap'><div class='card'><p class='bad'>Too many login attempts. Try again later.</p></div></div>"
         ), 429
@@ -985,7 +959,6 @@ def dashboard():
       <div class="card"><div class="small">Active Bans</div><div class="stat">{{ blocked }}</div></div>
       <div class="card"><div class="small">Successful Logins (24h)</div><div class="stat">{{ recent_logins }}</div></div>
     </div>
-    <div class="card"><h2>Security Monitor</h2><p class="small">Review failed logins, invalid sessions and temporary automatic blocks.</p><a class="btn primary" href="{{ url_for('security_monitor_page') }}">Open Security Monitor</a></div>
 
     <div class="card">
       <h2>MOD MENU Status</h2>
@@ -1217,4 +1190,594 @@ def extend_key(key_id):
             old_exp = parse_iso(row["expires_at"])
             base = old_exp if old_exp and old_exp > now_utc() else now_utc()
             c.execute("UPDATE keys SET expires_at=? WHERE id=?", (iso(base + timedelta(days=days)), key_id))
-    # Permanent keys have no expiry, so extending them leaves t
+        else:
+            # A permanent key remains permanent; no artificial expiry is added.
+            pass
+    audit("KEY_EXTENDED", f"key_id={key_id} days={days}")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/pause")
+@admin_required
+def pause_key_timer(key_id):
+    require_csrf()
+    with db() as c:
+        row = c.execute("SELECT * FROM keys WHERE id=?", (key_id,)).fetchone()
+        if not row:
+            abort(404)
+        if row["is_paused"]:
+            remaining = max(1, int(row["paused_remaining"] or 0))
+            c.execute("UPDATE keys SET is_paused=0, paused_remaining=NULL, expires_at=? WHERE id=?",
+                      (iso(now_utc() + timedelta(seconds=remaining)), key_id))
+            action = "resumed"
+        elif row["expires_at"]:
+            exp = parse_iso(row["expires_at"])
+            remaining = max(0, int((exp - now_utc()).total_seconds())) if exp else 0
+            c.execute("UPDATE keys SET is_paused=1, paused_remaining=?, expires_at=NULL WHERE id=?",
+                      (remaining, key_id))
+            action = "paused"
+        else:
+            return redirect(url_for("keys_page"))
+    audit("KEY_TIMER_" + action.upper(), f"key_id={key_id}")
+    return redirect(url_for("keys_page"))
+
+
+@app.post("/keys/<int:key_id>/delete")
+@admin_required
+def delete_key(key_id):
+    require_csrf()
+    with db() as c:
+        c.execute("DELETE FROM keys WHERE id=?", (key_id,))
+    audit("KEY_DELETED", f"key_id={key_id}")
+    return redirect(url_for("keys_page"))
+
+
+@app.get("/devices")
+@admin_required
+def devices_page():
+    term = request.args.get("q", "").strip()[:200]
+    with db() as c:
+        if term:
+            like = f"%{term}%"
+            rows = c.execute("""
+                SELECT d.*, k.key,
+                       COALESCE((SELECT GROUP_CONCAT(ip, ', ')
+                         FROM device_ips x
+                         WHERE x.key_id=d.key_id AND x.hwid=d.hwid), '') AS ips
+                FROM devices d JOIN keys k ON k.id=d.key_id
+                WHERE d.hwid LIKE ? OR k.key LIKE ? OR d.last_ip LIKE ?
+                   OR EXISTS (SELECT 1 FROM device_ips x
+                              WHERE x.key_id=d.key_id AND x.hwid=d.hwid AND x.ip LIKE ?)
+                ORDER BY d.last_seen DESC
+            """, (like, like, like, like)).fetchall()
+        else:
+            rows = c.execute("""
+                SELECT d.*, k.key,
+                       COALESCE((SELECT GROUP_CONCAT(ip, ', ')
+                         FROM device_ips x
+                         WHERE x.key_id=d.key_id AND x.hwid=d.hwid), '') AS ips
+                FROM devices d JOIN keys k ON k.id=d.key_id
+                ORDER BY d.last_seen DESC
+            """).fetchall()
+
+    body = """
+    <h1>Devices & IP Addresses</h1>
+    <div class="card">
+      <form method="get">
+        <input name="q" value="{{ term }}" placeholder="Search IP, HWID or key">
+        <button class="btn primary">Search</button>
+        <a class="btn" href="{{ url_for('devices_page') }}">Clear</a>
+        <a class="btn" href="{{ url_for('export_devices') }}">Export CSV</a>
+      </form>
+      <div class="table-scroll"><table>
+        <tr><th>Key</th><th>HWID</th><th>IP addresses</th><th>First seen</th><th>Last seen</th><th>Actions</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td><code>{{ r['key'] }}</code></td>
+          <td><code>{{ r['hwid'] }}</code> <button type="button" class="btn" onclick="copyText({{ r['hwid']|tojson }})">Copy</button></td>
+          <td>
+            {% if r['ips'] %}
+              {% for ip in r['ips'].split(', ') %}
+                <div><code>{{ ip }}</code> <button type="button" class="btn" onclick="copyText({{ ip|tojson }})">Copy</button>
+                <form class="inline" method="post" action="{{ url_for('create_ban') }}">
+                  <input type="hidden" name="csrf" value="{{ csrf }}">
+                  <input type="hidden" name="ban_type" value="IP">
+                  <input type="hidden" name="value" value="{{ ip }}">
+                  <input type="hidden" name="duration" value="permanent">
+                  <input type="hidden" name="reason" value="Blocked from device list">
+                  <button class="btn danger">Block IP</button>
+                </form></div>
+              {% endfor %}
+            {% else %}<span class="small">No IP recorded yet</span>{% endif %}
+          </td>
+          <td>{{ r['first_seen'] }}</td><td>{{ r['last_seen'] }}</td>
+          <td>
+            <form class="inline" method="post" action="{{ url_for('create_ban') }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="ban_type" value="HWID">
+              <input type="hidden" name="value" value="{{ r['hwid'] }}">
+              <input type="hidden" name="duration" value="permanent">
+              <input type="hidden" name="reason" value="Blocked from device list">
+              <button class="btn danger">Block HWID</button>
+            </form>
+            <form class="inline" method="post" action="{{ url_for('delete_device', device_id=r['id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <button class="btn">Unregister</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </table></div>
+    </div>
+    <script>
+    async function copyText(value){
+      try { await navigator.clipboard.writeText(value); }
+      catch(e){
+        const t=document.createElement('textarea'); t.value=value;
+        document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove();
+      }
+    }
+    </script>
+    """
+    return page("Devices & IPs", render_template_string(
+        body, rows=rows, term=term, csrf=csrf_token()
+    ))
+
+
+@app.post("/devices/<int:device_id>/delete")
+@admin_required
+def delete_device(device_id):
+    require_csrf()
+    with db() as c:
+        row = c.execute(
+            "SELECT key_id,hwid FROM devices WHERE id=?",
+            (device_id,)
+        ).fetchone()
+        if row:
+            c.execute("DELETE FROM devices WHERE id=?", (device_id,))
+            c.execute("""
+                UPDATE api_sessions SET revoked=1
+                WHERE key_id=? AND hwid=?
+            """, (row["key_id"], row["hwid"]))
+    audit("DEVICE_REMOVED", f"device_id={device_id}")
+    return redirect(url_for("devices_page"))
+
+
+@app.get("/features")
+@admin_required
+def features_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM feature_permissions
+            ORDER BY feature_id
+        """).fetchall()
+
+    body = """
+    <h1>MOD MENU Permissions</h1>
+
+    <div class="card">
+      <p>
+        Global status:
+        <b class="{{ 'ok' if menu_enabled else 'bad' }}">
+          {{ 'ENABLED' if menu_enabled else 'DISABLED' }}
+        </b>
+      </p>
+      <p class="small">
+        Disabling a feature here prevents the server from granting that
+        feature permission to new/session-refresh responses.
+      </p>
+    </div>
+
+    <div class="card">
+      <table>
+        <tr><th>ID</th><th>Feature</th><th>Global</th><th>Min Version</th><th>Save</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['feature_id'] }}</td>
+          <td>{{ r['name'] }}</td>
+          <td>
+            <form method="post" action="{{ url_for('feature_update', feature_id=r['feature_id']) }}">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <select name="enabled">
+                <option value="1" {{ 'selected' if r['enabled'] else '' }}>Enabled</option>
+                <option value="0" {{ 'selected' if not r['enabled'] else '' }}>Disabled</option>
+              </select>
+          </td>
+          <td><input name="min_client_version" value="{{ r['min_client_version'] }}"></td>
+          <td><button class="btn primary">Save</button></form></td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("MOD MENU", render_template_string(
+        body,
+        rows=rows,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        csrf=csrf_token()
+    ))
+
+
+@app.post("/features/<int:feature_id>/update")
+@admin_required
+def feature_update(feature_id):
+    require_csrf()
+    enabled = 1 if request.form.get("enabled") == "1" else 0
+    version = request.form.get("min_client_version", "1.0.0")[:50]
+
+    with db() as c:
+        c.execute("""
+            UPDATE feature_permissions
+            SET enabled=?, min_client_version=?
+            WHERE feature_id=?
+        """, (enabled, version, feature_id))
+
+    audit(
+        "FEATURE_UPDATED",
+        f"id={feature_id} enabled={enabled} min_version={version}"
+    )
+    return redirect(url_for("features_page"))
+
+
+@app.get("/settings")
+@admin_required
+def settings_page():
+    body = """
+    <h1>Server Settings</h1>
+    <div class="card">
+      <form method="post">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <label>MOD MENU</label>
+        <select name="menu_enabled">
+          <option value="1" {{ 'selected' if menu_enabled else '' }}>Enabled</option>
+          <option value="0" {{ 'selected' if not menu_enabled else '' }}>Disabled</option>
+        </select>
+
+        <label>Maintenance</label>
+        <select name="maintenance">
+          <option value="0" {{ 'selected' if not maintenance else '' }}>OFF</option>
+          <option value="1" {{ 'selected' if maintenance else '' }}>ON</option>
+        </select>
+
+        <label>Menu Version</label>
+        <input name="menu_version" value="{{ version }}">
+
+        <label>Minimum Client Version</label>
+        <input name="min_client_version" value="{{ minver }}">
+
+        <label>Announcement</label>
+        <textarea name="announcement" rows="4">{{ announcement }}</textarea>
+
+        <button class="btn primary">Save Settings</button>
+      </form>
+    </div>
+    """
+    return page("Settings", render_template_string(
+        body,
+        menu_enabled=get_setting("menu_enabled") == "1",
+        maintenance=get_setting("maintenance") == "1",
+        version=get_setting("menu_version", "1.0.0"),
+        minver=get_setting("min_client_version", "1.0.0"),
+        announcement=get_setting("announcement", ""),
+        csrf=csrf_token()
+    ))
+
+
+@app.post("/settings")
+@admin_required
+def settings_save():
+    require_csrf()
+
+    set_setting("menu_enabled", "1" if request.form.get("menu_enabled") == "1" else "0")
+    set_setting("maintenance", "1" if request.form.get("maintenance") == "1" else "0")
+    set_setting("menu_version", request.form.get("menu_version", "1.0.0")[:50])
+    set_setting("min_client_version", request.form.get("min_client_version", "1.0.0")[:50])
+    set_setting("announcement", request.form.get("announcement", "")[:2000])
+
+    # Kill switch: immediately revoke all sessions.
+    if get_setting("menu_enabled") != "1" or get_setting("maintenance") == "1":
+        with db() as c:
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE revoked=0")
+
+    audit("SETTINGS_UPDATED", "server settings changed")
+    return redirect(url_for("settings_page"))
+
+
+@app.get("/login-activity")
+@admin_required
+def login_activity_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT created_at,event,ip,details
+            FROM audit_logs
+            WHERE event IN (
+                'API_LOGIN_OK',
+                'API_LOGIN_FAILED',
+                'ADMIN_LOGIN',
+                'ADMIN_LOGIN_FAILED'
+            )
+            ORDER BY id DESC
+            LIMIT 500
+        """).fetchall()
+
+    body = """
+    <h1>Login Activity</h1>
+    <div class="card">
+      <p class="small">
+        Successful and failed login attempts with IP, masked key,
+        HWID prefix and client version.
+      </p>
+      <div class="table-scroll">
+      <table>
+        <tr><th>Time</th><th>Result</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>
+            {% if r['event'] in ['API_LOGIN_OK','ADMIN_LOGIN'] %}
+              <span class="ok">{{ r['event'] }}</span>
+            {% else %}
+              <span class="bad">{{ r['event'] }}</span>
+            {% endif %}
+          </td>
+          <td><code>{{ r['ip'] or 'unknown' }}</code></td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      </div>
+    </div>
+    """
+    return page("Login Activity", render_template_string(body, rows=rows))
+
+
+@app.get("/logs")
+@admin_required
+def logs_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM audit_logs
+            ORDER BY id DESC LIMIT 300
+        """).fetchall()
+
+    body = """
+    <h1>Audit Logs</h1>
+    <div class="card">
+      <table>
+        <tr><th>Time</th><th>Event</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td>{{ r['event'] }}</td>
+          <td>{{ r['ip'] }}</td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    """
+    return page("Logs", render_template_string(body, rows=rows, csrf=csrf_token()))
+
+
+# ============================================================
+# BLOCK SYSTEM / SESSIONS / EXPORTS / BACKUP
+# ============================================================
+
+@app.get("/bans")
+@admin_required
+def bans_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT * FROM bans ORDER BY id DESC LIMIT 500
+        """).fetchall()
+    body = """
+    <h1>IP / HWID Block System</h1>
+    <div class="card">
+      <h2>Create a ban</h2>
+      <form method="post" action="{{ url_for('create_ban') }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <div class="row">
+          <div><label>Type</label><select name="ban_type"><option>IP</option><option>HWID</option></select></div>
+          <div><label>Address / HWID</label><input name="value" required maxlength="256"></div>
+          <div><label>Duration</label><select name="duration">
+            <option value="1h">1 hour</option><option value="24h">24 hours</option>
+            <option value="7d">7 days</option><option value="permanent">Permanent</option>
+          </select></div>
+        </div>
+        <label>Reason</label><input name="reason" maxlength="500" placeholder="Reason for blocking">
+        <button class="btn danger">Apply ban</button>
+      </form>
+    </div>
+    <div class="card"><h2>Ban records</h2><div class="table-scroll"><table>
+      <tr><th>Type</th><th>Value</th><th>Reason</th><th>Created</th><th>Expires</th><th>Status</th><th>Action</th></tr>
+      {% for r in rows %}
+      <tr><td>{{ r['ban_type'] }}</td><td><code>{{ r['value'] }}</code></td>
+      <td>{{ r['reason'] }}</td><td>{{ r['created_at'] }}</td>
+      <td>{{ r['expires_at'] or 'Permanent' }}</td>
+      <td>{{ 'Active' if r['active'] and (not r['expires_at'] or r['expires_at'] > now) else 'Inactive / Expired' }}</td>
+      <td>{% if r['active'] %}<form method="post" action="{{ url_for('remove_ban', ban_id=r['id']) }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn primary">Unblock</button>
+      </form>{% endif %}</td></tr>
+      {% endfor %}
+    </table></div></div>
+    """
+    return page("Block System", render_template_string(
+        body, rows=rows, csrf=csrf_token(), now=iso(now_utc())
+    ))
+
+
+@app.post("/bans/create")
+@admin_required
+def create_ban():
+    require_csrf()
+    ban_type = request.form.get("ban_type", "").upper()
+    value = request.form.get("value", "").strip()
+    reason = request.form.get("reason", "").strip()[:500]
+    duration = request.form.get("duration", "permanent")
+    if ban_type not in ("IP", "HWID") or not value or len(value) > 256:
+        abort(400, "Invalid ban type or value")
+    expiry = None
+    durations = {"1h": timedelta(hours=1), "24h": timedelta(hours=24), "7d": timedelta(days=7)}
+    if duration in durations:
+        expiry = iso(now_utc() + durations[duration])
+    elif duration != "permanent":
+        abort(400, "Invalid ban duration")
+    with db() as c:
+        c.execute("""
+            INSERT INTO bans(ban_type,value,reason,created_at,expires_at,active,created_by)
+            VALUES(?,?,?,?,?,1,?)
+        """, (ban_type, value, reason, iso(now_utc()), expiry, ADMIN_USER))
+        if ban_type == "HWID":
+            c.execute("UPDATE api_sessions SET revoked=1 WHERE hwid=?", (value,))
+        elif ban_type == "IP":
+            c.execute("""
+                UPDATE api_sessions SET revoked=1
+                WHERE hwid IN (SELECT hwid FROM device_ips WHERE ip=?)
+            """, (value,))
+    audit("BAN_CREATED", f"type={ban_type} value={value[:80]} duration={duration} reason={reason}")
+    return redirect(url_for("bans_page"))
+
+
+@app.post("/bans/<int:ban_id>/remove")
+@admin_required
+def remove_ban(ban_id):
+    require_csrf()
+    with db() as c:
+        c.execute("UPDATE bans SET active=0 WHERE id=?", (ban_id,))
+    audit("BAN_REMOVED", f"ban_id={ban_id}")
+    return redirect(url_for("bans_page"))
+
+
+@app.get("/sessions")
+@admin_required
+def sessions_page():
+    with db() as c:
+        rows = c.execute("""
+            SELECT s.id,s.hwid,s.created_at,s.expires_at,s.last_seen,s.revoked,k.key
+            FROM api_sessions s JOIN keys k ON k.id=s.key_id
+            ORDER BY s.id DESC LIMIT 500
+        """).fetchall()
+    body = """
+    <h1>API Sessions</h1><div class="card"><div class="table-scroll"><table>
+      <tr><th>Key</th><th>HWID</th><th>Created</th><th>Last seen</th><th>Expires</th><th>Status</th><th>Action</th></tr>
+      {% for r in rows %}<tr><td><code>{{ r['key'] }}</code></td><td><code>{{ r['hwid'] }}</code></td>
+      <td>{{ r['created_at'] }}</td><td>{{ r['last_seen'] }}</td><td>{{ r['expires_at'] }}</td>
+      <td>{{ 'Revoked' if r['revoked'] else 'Active / may expire' }}</td><td>
+      {% if not r['revoked'] %}<form method="post" action="{{ url_for('revoke_session', session_id=r['id']) }}">
+      <input type="hidden" name="csrf" value="{{ csrf }}"><button class="btn danger">Revoke</button></form>{% endif %}
+      </td></tr>{% endfor %}
+    </table></div></div>
+    """
+    return page("Sessions", render_template_string(body, rows=rows, csrf=csrf_token()))
+
+
+@app.post("/sessions/<int:session_id>/revoke")
+@admin_required
+def revoke_session(session_id):
+    require_csrf()
+    with db() as c:
+        c.execute("UPDATE api_sessions SET revoked=1 WHERE id=?", (session_id,))
+    audit("SESSION_REVOKED", f"session_id={session_id}")
+    return redirect(url_for("sessions_page"))
+
+
+@app.get("/export/devices.csv")
+@admin_required
+def export_devices():
+    import csv
+    import io
+    with db() as c:
+        rows = c.execute("""
+            SELECT k.key,d.hwid,d.first_seen,d.last_seen,d.last_ip,
+                   COALESCE((SELECT GROUP_CONCAT(ip, ';') FROM device_ips x
+                     WHERE x.key_id=d.key_id AND x.hwid=d.hwid),'') AS all_ips
+            FROM devices d JOIN keys k ON k.id=d.key_id
+            ORDER BY d.last_seen DESC
+        """).fetchall()
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["key", "hwid", "first_seen", "last_seen", "last_ip", "all_ips"])
+    for row in rows:
+        writer.writerow([row["key"], row["hwid"], row["first_seen"],
+                         row["last_seen"], row["last_ip"], row["all_ips"]])
+    response = make_response("\\ufeff" + output.getvalue())
+    response.headers["Content-Type"] = "text/csv; charset=utf-8"
+    response.headers["Content-Disposition"] = "attachment; filename=devices.csv"
+    audit("DEVICES_EXPORTED", f"rows={len(rows)}")
+    return response
+
+
+@app.get("/backup")
+@admin_required
+def backup_database():
+    import tempfile
+    from flask import send_file
+    fd, path = tempfile.mkstemp(prefix="server-backup-", suffix=".db")
+    os.close(fd)
+    try:
+        with sqlite3.connect(path) as target:
+            with db() as origin:
+                origin.backup(target)
+        audit("DATABASE_BACKUP", "database backup downloaded")
+        response = send_file(path, as_attachment=True, download_name="server-backup.db",
+                             mimetype="application/octet-stream")
+        response.call_on_close(lambda: os.path.exists(path) and os.remove(path))
+        return response
+    except Exception:
+        if os.path.exists(path):
+            os.remove(path)
+        raise
+
+
+# ============================================================
+# SECURITY HEADERS / ERROR RESPONSES
+# ============================================================
+
+@app.after_request
+def security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https://media.tenor.com;"
+    )
+    return response
+
+
+@app.errorhandler(400)
+def bad_request(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": str(e)}), 400
+    message = str(e)
+    if "Invalid CSRF token" in message:
+        return render_template_string(BASE_STYLE + """
+        <div class="wrap login-shell"><div class="card login-card">
+          <h1>Session expired</h1>
+          <p class="small">The security token for this page is no longer valid. Reload the panel and try again.</p>
+          <a class="btn primary" href="{{ url_for('keys_page') }}">Reload Keys</a>
+        </div></div>
+        """), 400
+    return message, 400
+
+
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return "Not found", 404
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+init_db()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8080"))
+    # Host must be 0.0.0.0 for Railway/Render/etc.
+    app.run(host="0.0.0.0", port=port, debug=False)
