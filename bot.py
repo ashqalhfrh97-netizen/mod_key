@@ -585,6 +585,7 @@ def api_health():
 @app.post("/api/v1/auth/login")
 def api_login():
     if not rate_limit("api_login", 12, 60):
+        audit("API_LOGIN_RATE_LIMIT", "login rate limit exceeded", current_client_ip())
         return jsonify({
             "success": False,
             "message": "Too many attempts"
@@ -677,6 +678,10 @@ def api_login():
 
 
 def require_api_session():
+    client_ip = current_client_ip()
+    if active_ban("IP", client_ip):
+        return None, "Access temporarily blocked"
+
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         return None, "Missing authorization"
@@ -702,6 +707,25 @@ def require_api_session():
         """, (token_hash,)).fetchone()
 
         if not row:
+            stamp = iso(now_utc())
+            c.execute(
+                "INSERT INTO audit_logs(created_at,event,ip,details) VALUES(?,?,?,?)",
+                (stamp, "API_INVALID_SESSION", client_ip, "Unknown or revoked bearer token")
+            )
+            since = iso(now_utc() - timedelta(minutes=10))
+            attempts = c.execute("""
+                SELECT COUNT(*) AS n FROM audit_logs
+                WHERE event='API_INVALID_SESSION' AND ip=? AND created_at>=?
+            """, (client_ip, since)).fetchone()["n"]
+            if attempts == 10:
+                expiry = iso(now_utc() + timedelta(minutes=15))
+                c.execute("""
+                    INSERT INTO bans(ban_type,value,reason,created_at,expires_at,active,created_by)
+                    VALUES('IP',?,?,?, ?,1,'security-monitor')
+                """, (client_ip, "10 invalid session tokens within 10 minutes", stamp, expiry))
+                c.execute("""
+                    INSERT INTO audit_logs(created_at,event,ip,details) VALUES(?,?,?,?)
+                """, (stamp, "AUTO_TEMP_IP_BLOCK", client_ip, "15-minute block after repeated invalid session tokens"))
             return None, "Invalid session"
 
         if active_ban("IP", current_client_ip()) or active_ban("HWID", row["hwid"]):
@@ -797,25 +821,25 @@ def api_logout():
 
 BASE_STYLE = """
 <style>
-:root{--bg:#070b12;--panel:#101927;--line:#26364d;--text:#eef5ff;--muted:#8fa2bb;--blue:#3b82f6;--green:#34d399;--red:#fb7185}
+:root{--bg:#100f16;--panel:#191722;--line:#393342;--text:#f5f0f7;--muted:#b0a6b8;--blue:#a78bfa;--green:#70d6ad;--red:#ff8295;--amber:#e7ad69}
 *{box-sizing:border-box}html{scroll-behavior:smooth}
-html{min-height:100%;background:#050812}
-body{margin:0;background:#050812;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
-body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.40;filter:saturate(1.18) contrast(1.08);pointer-events:none}
-body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(180deg,rgba(3,6,15,.48),rgba(3,6,15,.72));pointer-events:none}
+html{min-height:100%;background:#100f16}
+body{margin:0;background:#100f16;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;min-height:100vh;position:relative;overflow-x:hidden}
+body::before{content:"";position:fixed;inset:0;z-index:0;background-image:url("{{ anime_gif_url }}");background-position:center center;background-repeat:no-repeat;background-size:cover;background-attachment:fixed;opacity:.52;filter:saturate(.88) contrast(1.06);pointer-events:none}
+body::after{content:"";position:fixed;inset:0;z-index:0;background:linear-gradient(135deg,rgba(14,11,20,.58),rgba(18,14,25,.76));pointer-events:none}
 
-a{color:#9cc8ff;text-decoration:none}a:hover{color:#fff}
+a{color:#d2b6ff;text-decoration:none}a:hover{color:#fff}
 .wrap{max-width:1320px;margin:0 auto;padding:24px 16px 60px;position:relative;z-index:1}
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;padding:14px 16px;background:rgba(16,25,39,.9);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;position:sticky;top:12px;z-index:20;box-shadow:0 18px 55px rgba(0,0,0,.3)}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px;padding:14px 16px;background:rgba(25,22,34,.88);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;position:sticky;top:12px;z-index:20;box-shadow:0 18px 55px rgba(0,0,0,.3)}
 .brand{display:flex;align-items:center;gap:11px;font-weight:800}.brand-dot{width:11px;height:11px;border-radius:50%;background:var(--green);box-shadow:0 0 18px rgba(52,211,153,.75)}
-.nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#172337;color:#eaf2ff;border:1px solid #2c3e57;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#4d6b94;background:#1c2c44}
-.btn.primary{background:linear-gradient(135deg,#2563eb,#3b82f6);border-color:#4c8dff}.btn.danger{background:#65152b;border-color:#a83b59}
-.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:#0c1421;margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
-.card{background:linear-gradient(180deg,rgba(18,29,45,.97),rgba(12,20,32,.97));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
+.nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}.nav a,.btn{display:inline-flex;align-items:center;justify-content:center;padding:9px 12px;border-radius:10px;background:#282332;color:#f5eff8;border:1px solid #494052;cursor:pointer;font-weight:700;transition:.18s}.nav a:hover,.btn:hover{transform:translateY(-1px);border-color:#8f76ad;background:#342b3d}
+.btn.primary{background:linear-gradient(135deg,#76569b,#a17bb8);border-color:#b99bd0}.btn.danger{background:#642b3c;border-color:#a65b70}
+.hero{overflow:hidden;position:relative;border:1px solid var(--line);border-radius:20px;background:rgba(24,20,31,.84);margin-bottom:18px;box-shadow:0 18px 55px rgba(0,0,0,.28)}.hero-overlay{position:absolute;inset:0;padding:28px;display:flex;align-items:flex-end;background:linear-gradient(90deg,rgba(5,9,15,.92),rgba(5,9,15,.25) 70%,rgba(5,9,15,.65))}.hero h1{font-size:clamp(26px,4vw,44px);margin:0 0 8px}.hero p{margin:0;color:#b8c7da}
+.card{background:linear-gradient(180deg,rgba(31,27,40,.94),rgba(21,19,29,.96));border:1px solid var(--line);border-radius:17px;padding:18px;margin-bottom:15px;box-shadow:0 12px 35px rgba(0,0,0,.18)}
 h1,h2,h3{margin-top:0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:13px}.stat{font-size:30px;font-weight:850;margin-top:5px}.small{color:var(--muted);font-size:13px}.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}
-input,select,textarea{width:100%;padding:11px 12px;margin:6px 0 12px;background:#09111d;color:#fff;border:1px solid #30435d;border-radius:10px;outline:none}input:focus,select:focus,textarea:focus{border-color:#5b9cff;box-shadow:0 0 0 3px rgba(59,130,246,.15)}
-table{width:100%;border-collapse:separate;border-spacing:0}th,td{padding:11px;border-bottom:1px solid #243247;text-align:left;vertical-align:middle}th{color:#a9bad0;font-size:12px;text-transform:uppercase;letter-spacing:.05em}tr:hover td{background:rgba(59,130,246,.035)}
-.badge{display:inline-flex;padding:4px 9px;border-radius:999px;background:#1c2a3d;border:1px solid #30435d}.ok{color:var(--green)}.bad{color:var(--red)}.inline{display:inline}code{color:#b9d7ff;background:#09111d;padding:3px 6px;border-radius:6px}.login-shell{min-height:92vh;display:grid;place-items:center}.login-card{width:min(460px,100%);padding:26px}.footer{text-align:center;color:#71839a;font-size:12px;margin-top:20px}
+input,select,textarea{width:100%;padding:11px 12px;margin:6px 0 12px;background:#17141f;color:#f8f2fa;border:1px solid #494052;border-radius:10px;outline:none}input:focus,select:focus,textarea:focus{border-color:#b99bd0;box-shadow:0 0 0 3px rgba(167,139,250,.15)}
+table{width:100%;border-collapse:separate;border-spacing:0}th,td{padding:11px;border-bottom:1px solid #393342;text-align:left;vertical-align:middle}th{color:#c0b5c8;font-size:12px;text-transform:uppercase;letter-spacing:.05em}tr:hover td{background:rgba(167,139,250,.045)}
+.badge{display:inline-flex;padding:4px 9px;border-radius:999px;background:#302a38;border:1px solid #494052}.ok{color:var(--green)}.bad{color:var(--red)}.inline{display:inline}code{color:#e0c8f5;background:#17141f;padding:3px 6px;border-radius:6px}.login-shell{min-height:92vh;display:grid;place-items:center}.login-card{width:min(460px,100%);padding:26px}.footer{text-align:center;color:#93899c;font-size:12px;margin-top:20px}
 @media(max-width:800px){.topbar{position:static;align-items:flex-start;flex-direction:column}.nav{justify-content:flex-start}.hero-overlay{padding:20px}table{display:block;overflow-x:auto;white-space:nowrap}}
 </style>
 """
@@ -838,6 +862,7 @@ def page(title, body):
               <a href="{{ url_for('settings_page') }}">Settings</a>
               <a href="{{ url_for('logs_page') }}">Logs</a>
             <a href="{{ url_for('login_activity_page') }}">Login Activity</a>
+              <a href="{{ url_for('security_monitor_page') }}">Security Monitor</a>
               <a href="{{ url_for('logout') }}">Logout</a>
             </nav>
           </header>
@@ -880,6 +905,7 @@ def login():
 @app.post("/login")
 def login_post():
     if not rate_limit("admin_login", 8, 60):
+        audit("ADMIN_LOGIN_RATE_LIMIT", "admin login rate limit exceeded", current_client_ip())
         return render_template_string(
             BASE_STYLE + "<div class='wrap'><div class='card'><p class='bad'>Too many login attempts. Try again later.</p></div></div>"
         ), 429
@@ -959,6 +985,7 @@ def dashboard():
       <div class="card"><div class="small">Active Bans</div><div class="stat">{{ blocked }}</div></div>
       <div class="card"><div class="small">Successful Logins (24h)</div><div class="stat">{{ recent_logins }}</div></div>
     </div>
+    <div class="card"><h2>Security Monitor</h2><p class="small">Review failed logins, invalid sessions and temporary automatic blocks.</p><a class="btn primary" href="{{ url_for('security_monitor_page') }}">Open Security Monitor</a></div>
 
     <div class="card">
       <h2>MOD MENU Status</h2>
@@ -1529,6 +1556,98 @@ def login_activity_page():
     </div>
     """
     return page("Login Activity", render_template_string(body, rows=rows))
+
+
+@app.get("/security-monitor")
+@admin_required
+def security_monitor_page():
+    term = request.args.get("q", "").strip()[:120]
+    event_filter = request.args.get("event", "").strip()[:80]
+    since = iso(now_utc() - timedelta(hours=24))
+
+    security_events = (
+        "API_LOGIN_FAILED", "API_LOGIN_BLOCKED", "API_LOGIN_RATE_LIMIT",
+        "ADMIN_LOGIN_FAILED", "ADMIN_LOGIN_RATE_LIMIT", "API_INVALID_SESSION",
+        "AUTO_TEMP_IP_BLOCK", "BAN_CREATED", "SESSION_REVOKED"
+    )
+    placeholders = ",".join("?" for _ in security_events)
+    with db() as c:
+        total_24h = c.execute(
+            f"SELECT COUNT(*) n FROM audit_logs WHERE created_at>=? AND event IN ({placeholders})",
+            (since, *security_events)
+        ).fetchone()["n"]
+        failed_logins = c.execute("""
+            SELECT COUNT(*) n FROM audit_logs
+            WHERE created_at>=? AND event IN ('API_LOGIN_FAILED','ADMIN_LOGIN_FAILED')
+        """, (since,)).fetchone()["n"]
+        auto_blocks = c.execute("""
+            SELECT COUNT(*) n FROM audit_logs
+            WHERE created_at>=? AND event='AUTO_TEMP_IP_BLOCK'
+        """, (since,)).fetchone()["n"]
+        active_blocks = c.execute("""
+            SELECT COUNT(*) n FROM bans
+            WHERE active=1 AND (expires_at IS NULL OR expires_at>?)
+        """, (iso(now_utc()),)).fetchone()["n"]
+
+        where = [f"event IN ({placeholders})"]
+        params = list(security_events)
+        if term:
+            where.append("(ip LIKE ? OR details LIKE ? OR event LIKE ?)")
+            like = f"%{term}%"
+            params.extend([like, like, like])
+        if event_filter:
+            where.append("event=?")
+            params.append(event_filter)
+        rows = c.execute(
+            "SELECT created_at,event,ip,details FROM audit_logs WHERE "
+            + " AND ".join(where) + " ORDER BY id DESC LIMIT 300",
+            params
+        ).fetchall()
+
+    body = """
+    <h1>Security Monitor</h1>
+    <p class="small">Server-side security events, failed logins and temporary blocks</p>
+    <div class="grid">
+      <div class="card"><div class="small">Security events (24h)</div><div class="stat">{{ total_24h }}</div></div>
+      <div class="card"><div class="small">Failed logins (24h)</div><div class="stat">{{ failed_logins }}</div></div>
+      <div class="card"><div class="small">Automatic temporary blocks (24h)</div><div class="stat">{{ auto_blocks }}</div></div>
+      <div class="card"><div class="small">Currently active blocks</div><div class="stat">{{ active_blocks }}</div></div>
+    </div>
+    <div class="card">
+      <form method="get">
+        <div class="row">
+          <div><label>Search IP / details / event</label><input name="q" value="{{ term }}" placeholder="Search security events"></div>
+          <div><label>Event type</label><select name="event">
+            <option value="">All security events</option>
+            {% for event in event_options %}<option value="{{ event }}" {{ 'selected' if event_filter==event else '' }}>{{ event }}</option>{% endfor %}
+          </select></div>
+        </div>
+        <button class="btn primary">Filter</button>
+        <a class="btn" href="{{ url_for('security_monitor_page') }}">Reset</a>
+      </form>
+      <div class="table-scroll"><table>
+        <tr><th>Time (UTC)</th><th>Event</th><th>IP</th><th>Details</th></tr>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r['created_at'] }}</td>
+          <td><span class="{{ 'bad' if ('FAILED' in r['event'] or 'BLOCK' in r['event'] or 'INVALID' in r['event']) else 'badge' }}">{{ r['event'] }}</span></td>
+          <td><code>{{ r['ip'] or 'unknown' }}</code></td>
+          <td>{{ r['details'] }}</td>
+        </tr>
+        {% else %}<tr><td colspan="4" class="small">No matching security events.</td></tr>{% endfor %}
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>Automatic protection policy</h3>
+      <p class="small">An IP receives a 15-minute temporary block only after the server records 10 invalid or revoked bearer-token attempts from that IP within 10 minutes. A client-side claim that its DEX or response was modified is not treated as proof and cannot trigger a ban by itself.</p>
+    </div>
+    """
+    return page("Security Monitor", render_template_string(
+        body, total_24h=total_24h, failed_logins=failed_logins,
+        auto_blocks=auto_blocks, active_blocks=active_blocks,
+        rows=rows, term=term, event_filter=event_filter,
+        event_options=security_events
+    ))
 
 
 @app.get("/logs")
